@@ -19,36 +19,34 @@ MAX30105 sensor;
 
 /* ===== BPM ===== */
 unsigned long lastBeat = 0;
-float bpm = 0;
-float bpmEMA = 0; // EMA cho nhịp mượt
-#define EMA_ALPHA 0.3 // hệ số làm mượt
+float bpmEMA = 0;
+#define EMA_ALPHA 0.3
 
-/* ===== PHÁT HIỆN TAY ===== */
+/* ===== PULSE ANIMATION ===== */
+bool pulseFlag = false;
+
+/* ===== HAND DETECTION ===== */
 #define IR_THRESHOLD 10000
 bool handDetected = false;
 
-/* ===== THỜI GIAN ===== */
+/* ===== TIME ===== */
 unsigned long lastOLED = 0;
 unsigned long lastWait = 0;
-unsigned long lastPulseBlink = 0;
-bool pulseState = false;
 
 void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  /* OLED INIT */
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while (1);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while(1);
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  /* MAX30102 INIT */
   if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
     display.setTextSize(1);
-    display.setCursor(0, 0);
+    display.setCursor(0,0);
     display.println("MAX30102 ERROR");
     display.display();
-    while (1);
+    while(1);
   }
 
   sensor.setup(0x1F, 4, 2, 400, 411, 4096);
@@ -61,7 +59,7 @@ void setup() {
 void loop() {
   long irValue = sensor.getIR();
 
-  /* ===== KHÔNG CÓ NGÓN TAY ===== */
+  /* ===== HAND DETECTION ===== */
   if (irValue < IR_THRESHOLD) {
     handDetected = false;
     resetBPM();
@@ -74,7 +72,7 @@ void loop() {
 
   handDetected = true;
 
-  /* ===== PHÁT HIỆN NHỊP TIM ===== */
+  /* ===== HEARTBEAT DETECTION ===== */
   if (checkForBeat(irValue)) {
     unsigned long now = millis();
     float delta = (now - lastBeat) / 1000.0;
@@ -83,66 +81,58 @@ void loop() {
     float currentBPM = 60.0 / delta;
 
     if (currentBPM > 45 && currentBPM < 180) {
-      // EMA làm mượt
       if (bpmEMA == 0) bpmEMA = currentBPM;
-      else bpmEMA = EMA_ALPHA * currentBPM + (1 - EMA_ALPHA) * bpmEMA;
+      else if (abs(currentBPM - bpmEMA) < 15)
+        bpmEMA = EMA_ALPHA * currentBPM + (1 - EMA_ALPHA) * bpmEMA;
 
-      Serial.print("BPM: ");
-      Serial.println(round(bpmEMA));
-
-      // Nhấp nháy nhịp tim
-      pulseState = true;
-      lastPulseBlink = millis();
+      Serial.print("BPM: "); Serial.println(round(bpmEMA));
+      pulseFlag = true;
     }
   }
 
-  /* ===== CẬP NHẬT OLED ===== */
-  if (millis() - lastOLED > 150) { // cập nhật 150ms đủ mượt
+  /* ===== UPDATE OLED ===== */
+  if (millis() - lastOLED > 150) {
     lastOLED = millis();
-    showBPM(round(bpmEMA), pulseState);
-    pulseState = false;
+    showBPM(round(bpmEMA), pulseFlag);
+    pulseFlag = false;
   }
 }
 
-/* ===== RESET ===== */
+/* ===== RESET BPM ===== */
 void resetBPM() {
-  bpm = 0;
   bpmEMA = 0;
 }
 
-/* ===== OLED: CHỜ ĐẶT TAY ===== */
-void showWaiting() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(20, 12);
-  display.println("DAT NGON TAY");
-
-  display.setTextSize(2);
-  display.setCursor(40, 32);
-  display.println("...");
-  display.display();
-}
-
-/* ===== OLED: HIỂN THỊ BPM + NHỊP TIM NHẤP NHÁY ===== */
-void showBPM(int bpmValue, bool pulse) {
+/* ===== OLED: SHOW BPM + PULSE ===== */
+void showBPM(uint8_t bpmVal, bool pulse) {
   display.clearDisplay();
 
-  // Tiêu đề
   display.setTextSize(1);
-  display.setCursor(32, 0);
+  display.setCursor(32,0);
   display.println("HEART RATE");
 
-  // Nhịp tim
   display.setTextSize(3);
-  display.setCursor(18, 22);
-  if (bpmValue > 0) display.print(bpmValue);
+  display.setCursor(18,22);
+  if (bpmVal>0) display.print(bpmVal);
   else display.print("--");
   display.println(" BPM");
 
-  // Nhấp nháy theo nhịp tim
   if (pulse) {
-    display.fillCircle(110, 10, 5, SSD1306_WHITE);
+    display.fillCircle(110,10,5,SSD1306_WHITE);
   }
 
+  display.display();
+}
+
+/* ===== OLED: WAITING ===== */
+void showWaiting() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(20,12);
+  display.println("DAT NGON TAY");
+
+  display.setTextSize(2);
+  display.setCursor(40,32);
+  display.println("...");
   display.display();
 }
