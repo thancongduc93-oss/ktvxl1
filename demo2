@@ -56,15 +56,7 @@ void setup() {
   }
 
   /* ===== CẤU HÌNH CHUẨN – ỔN ĐỊNH BPM ===== */
-  sensor.setup(
-    0x1F,   // LED brightness
-    4,      // Sample average
-    2,      // IR ONLY
-    400,    // Sample rate (Hz)
-    411,    // Pulse width
-    4096    // ADC range
-  );
-
+  sensor.setup(0x1F, 4, 2, 400, 411, 4096);
   sensor.setPulseAmplitudeIR(0x2A);
   sensor.setPulseAmplitudeRed(0x00);
 
@@ -76,8 +68,7 @@ void loop() {
 
   /* ===== KHÔNG CÓ NGÓN TAY ===== */
   if (irValue < IR_THRESHOLD) {
-    bpmAvg = 0;
-    lastBpm = 0;
+    resetBPM();  // reset toàn bộ dữ liệu nhịp tim
 
     if (millis() - lastWait > 300) {
       lastWait = millis();
@@ -117,6 +108,15 @@ void loop() {
     lastOLED = millis();
     showBPM(bpmAvg);
   }
+}
+
+/* ===== RESET TOÀN BỘ DỮ LIỆU NHỊP TIM ===== */
+void resetBPM() {
+  bpm = 0;
+  lastBpm = 0;
+  bpmAvg = 0;
+  rateIndex = 0;
+  for (byte i = 0; i < RATE_SIZE; i++) rates[i] = 0;
 }
 
 /* ===== OLED: CHỜ ĐẶT TAY ===== */
