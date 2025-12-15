@@ -1,0 +1,146 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/* ===== OLED ===== */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+/* ===== ESP32-C3 I2C ===== */
+#define I2C_SDA 8
+#define I2C_SCL 9
+
+/* ===== MAX30102 ===== */
+MAX30105 sensor;
+
+/* ===== HAND DETECTION ===== */
+#define IR_THRESHOLD 40000
+bool handDetected = false;
+
+/* ===== RR BUFFER ===== */
+#define RR_BUF 8                 // Apple Watch ~6–8 nhịp
+float rrBuf[RR_BUF];
+uint8_t rrCount = 0;
+uint8_t rrIndex = 0;
+
+/* ===== BPM ===== */
+float bpmStable = 0;
+bool bpmReady = false;
+
+/* ===== TIME ===== */
+unsigned long lastBeat = 0;
+unsigned long lastOLED = 0;
+
+/* ================================================= */
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.setTextColor(SSD1306_WHITE);
+  display.clearDisplay();
+
+  sensor.begin(Wire, I2C_SPEED_FAST);
+  sensor.setup(0x1F, 4, 2, 400, 411, 4096);
+  sensor.setPulseAmplitudeIR(0x2A);
+  sensor.setPulseAmplitudeRed(0x00);
+
+  showWaiting();
+}
+
+/* ================================================= */
+
+void loop() {
+  long irValue = sensor.getIR();
+
+  /* ===== NO HAND ===== */
+  if (irValue < IR_THRESHOLD) {
+    resetAll();
+    showWaiting();
+    delay(200);
+    return;
+  }
+
+  /* ===== HEART BEAT ===== */
+  if (checkForBeat(irValue)) {
+    unsigned long now = millis();
+    float rr = (now - lastBeat) / 1000.0;
+    lastBeat = now;
+
+    if (rr > 0.33 && rr < 1.5) {   // 40–180 BPM
+      rrBuf[rrIndex] = rr;
+      rrIndex = (rrIndex + 1) % RR_BUF;
+      if (rrCount < RR_BUF) rrCount++;
+
+      /* ===== ONLY CALCULATE WHEN BUFFER FULL ===== */
+      if (rrCount >= RR_BUF) {
+        float rrAvg = 0;
+        for (int i = 0; i < RR_BUF; i++) rrAvg += rrBuf[i];
+        rrAvg /= RR_BUF;
+
+        float newBPM = 60.0 / rrAvg;
+
+        /* EMA smoothing (Apple Watch style) */
+        if (!bpmReady) bpmStable = newBPM;
+        else bpmStable = 0.2 * newBPM + 0.8 * bpmStable;
+
+        bpmReady = true;
+        Serial.print("BPM: ");
+        Serial.println((int)bpmStable);
+      }
+    }
+  }
+
+  /* ===== OLED UPDATE ===== */
+  if (millis() - lastOLED > 300) {
+    lastOLED = millis();
+    if (bpmReady) showBPM((int)bpmStable);
+    else showMeasuring();
+  }
+}
+
+/* ================================================= */
+
+void resetAll() {
+  rrCount = 0;
+  rrIndex = 0;
+  bpmReady = false;
+  bpmStable = 0;
+  lastBeat = 0;
+}
+
+/* ===== OLED ===== */
+void showBPM(uint8_t bpm) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(30, 0);
+  display.println("HEART RATE");
+
+  display.setTextSize(3);
+  display.setCursor(22, 24);
+  display.print(bpm);
+  display.println(" BPM");
+
+  display.display();
+}
+
+void showWaiting() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(22, 20);
+  display.println("DAT NGON TAY");
+  display.display();
+}
+
+void showMeasuring() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(20, 20);
+  display.println("DANG DO...");
+  display.display();
+}
