@@ -1,0 +1,294 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <WiFi.h>
+#include <time.h>
+
+/* ===== WIFI & NTP ===== */
+const char* ssid     = "MU VO DICH";
+const char* password = "12344321";
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7*3600;
+const int   daylightOffset_sec = 0;
+
+/* ===== OLED ===== */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+/* ===== PINS ===== */
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define BTN_PIN 4
+#define STATUS_LED_PIN 5
+
+/* ===== MAX30102 ===== */
+#define I2C_ADDR_MAX30102 0x57
+int irpower = 0xD0, rpower = 0xA0, lirpower=0, lrpower=0;
+
+/* ===== FIR BUFFERS ===== */
+float firxv[5]={0}, firyv[5]={0}, fredxv[5]={0}, fredyv[5]={0};
+
+/* ===== STATUS ===== */
+float heartrate=0, pctspo2=100;
+bool finger_on_sensor=false;
+bool measuring=false;
+unsigned long tcnt=0;
+unsigned long lastBtn=0;
+uint8_t currentHour=0, currentMinute=0;
+unsigned long fingerLastSeen=0;
+
+/* ===== SMOOTHING ===== */
+#define BPM_BUF_SIZE 10
+float bpmBuf[BPM_BUF_SIZE]={0};
+uint8_t bpmIndex=0;
+
+float smoothBPM(float newBPM){
+    if(newBPM <= 0) return (heartrate>0)?heartrate:0;
+    bpmBuf[bpmIndex]=newBPM;
+    bpmIndex=(bpmIndex+1)%BPM_BUF_SIZE;
+    float sum=0; uint8_t count=0;
+    for(uint8_t i=0;i<BPM_BUF_SIZE;i++){
+        if(bpmBuf[i]>0){ sum+=bpmBuf[i]; count++; }
+    }
+    return (count>0)?sum/count:0;
+}
+
+float spo2Stable=0;
+float smoothSpO2(float newSpO2){
+    if(newSpO2 <= 0) return spo2Stable;
+    if(spo2Stable==0) spo2Stable=newSpO2;
+    else spo2Stable=0.3*newSpO2+0.7*spo2Stable;
+    return spo2Stable;
+}
+
+/* ===== PROTOTYPES OLED ===== */
+void drawBattery(uint8_t x,uint8_t y,uint8_t level);
+void drawWifi(uint8_t x,uint8_t y);
+void drawHeart(uint8_t x,uint8_t y, bool beat=false);
+void drawO2Icon(uint8_t x,uint8_t y);
+void setupNTP();
+void printLocalTime(uint8_t &hour,uint8_t &minute);
+void showStatus();
+
+/* ===== I2C WRITE ===== */
+void i2c_write(uint8_t reg,uint8_t data){
+    Wire.beginTransmission(I2C_ADDR_MAX30102);
+    Wire.write(reg);
+    Wire.write(data);
+    Wire.endTransmission();
+}
+
+/* ===== INIT MAX30102 ===== */
+void max30102_init(){
+    Wire.begin(I2C_SDA,I2C_SCL);
+    Wire.setClock(800000); // high speed
+    i2c_write(0x08,0x40);
+    i2c_write(0x09,0x03);
+    i2c_write(0x0A,(0x3<<5)+(0x3<<2)+0x3);
+    i2c_write(0x0C,irpower);
+    i2c_write(0x0D,rpower);
+
+    // Initialize FIR buffers
+    uint8_t regdata[6];
+    Wire.beginTransmission(I2C_ADDR_MAX30102);
+    Wire.write(0x07);
+    Wire.endTransmission(false);
+    Wire.requestFrom(I2C_ADDR_MAX30102, 6);
+    for(int i=0;i<6;i++) regdata[i]=Wire.read();
+    long irVal = ((regdata[0]&0x03)*65536 + regdata[1]*256 + regdata[2]);
+    long redVal = ((regdata[3]&0x03)*65536 + regdata[4]*256 + regdata[5]);
+    for(int i=0;i<5;i++){
+        firxv[i]=firyv[i]=irVal;
+        fredxv[i]=fredyv[i]=redVal;
+    }
+}
+
+/* ===== OLED INIT ===== */
+void display_init(){
+    if(!display.begin(SSD1306_SWITCHCAPVCC,0x3C)){
+        Serial.println(F("SSD1306 fail"));
+        for(;;);
+    }
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.display();
+}
+
+/* ===== READ FIFO ===== */
+int read_fifo(uint8_t *buffer,int max_samples){
+    Wire.beginTransmission(I2C_ADDR_MAX30102);
+    Wire.write(0x04);
+    Wire.endTransmission(false);
+    Wire.requestFrom(I2C_ADDR_MAX30102,3);
+    uint8_t rptr=Wire.read(), wptr=Wire.read();
+    Wire.read();
+    int samp=((32+wptr)-rptr)%32;
+    if(samp>max_samples) samp=max_samples;
+    Wire.beginTransmission(I2C_ADDR_MAX30102);
+    Wire.write(0x07);
+    Wire.endTransmission(false);
+    Wire.requestFrom(I2C_ADDR_MAX30102,samp*6);
+    for(int i=0;i<samp*6;i++) buffer[i]=Wire.read();
+    return samp;
+}
+
+/* ===== TASK: READ SENSOR & CALCULATE ===== */
+void max30102_task(void *pvParameters){
+    uint8_t regdata[192];
+    float hrarr[10]={0}, spo2arr[10]={0};
+    int hrcnt=0;
+    float lastmeastime=0;
+    bool beatFlag=false;
+
+    while(1){
+        if(lirpower!=irpower){ i2c_write(0x0C,irpower); lirpower=irpower; }
+        if(lrpower!=rpower){ i2c_write(0x0D,rpower); lrpower=rpower; }
+
+        int samp=read_fifo(regdata,32);
+        for(int cnt=0;cnt<samp;cnt++){
+            float meastime=0.01*tcnt++;
+
+            long irValue = ((regdata[6*cnt+0]&0x03)*65536 + regdata[6*cnt+1]*256 + regdata[6*cnt+2]);
+            long redValue = ((regdata[6*cnt+3]&0x03)*65536 + regdata[6*cnt+4]*256 + regdata[6*cnt+5]);
+
+            // HYSTERESIS IR
+            if(irValue > 20000){ finger_on_sensor=true; fingerLastSeen=millis(); }
+            else if(millis()-fingerLastSeen>1000) finger_on_sensor=false;
+
+            // FIR IR
+            for(int i=0;i<4;i++) firxv[i]=firxv[i+1];
+            firxv[4]=(1/3.48311)*(irValue);
+            for(int i=0;i<4;i++) firyv[i]=firyv[i+1];
+            firyv[4]=(firxv[0]+firxv[4])-2*firxv[2]+(-0.1718123813*firyv[0])+(0.3686645260*firyv[1])+(-1.1718123813*firyv[2])+(1.9738037992*firyv[3]);
+
+            // FIR RED
+            for(int i=0;i<4;i++) fredxv[i]=fredxv[i+1];
+            fredxv[4]=(1/3.48311)*redValue;
+            for(int i=0;i<4;i++) fredyv[i]=fredyv[i+1];
+            fredyv[4]=(fredxv[0]+fredxv[4])-2*fredxv[2]+(-0.1718123813*fredyv[0])+(0.3686645260*fredyv[1])+(-1.1718123813*fredyv[2])+(1.9738037992*fredyv[3]);
+
+            // PEAK DETECTION
+            if(-1.0*firyv[4]>=100 && -1.0*firyv[2]>-1*firyv[0] && -1.0*firyv[2]>-1*firyv[4]){
+                if(meastime-lastmeastime<0.5) continue;
+
+                hrarr[hrcnt%10]=60/(meastime-lastmeastime);
+                spo2arr[hrcnt%10]=110-25*((fredyv[4]/fredxv[4])/(firyv[4]/firxv[4]));
+                if(spo2arr[hrcnt%10]>100) spo2arr[hrcnt%10]=99.9;
+
+                lastmeastime=meastime;
+                hrcnt++;
+
+                if(hrcnt>=5){
+                    float rawBPM=0, rawSpO2=0;
+                    int countBPM=0, countSpO2=0;
+                    for(int i=0;i<10;i++){
+                        if(hrarr[i]>0){ rawBPM+=hrarr[i]; countBPM++; }
+                        if(spo2arr[i]>0){ rawSpO2+=spo2arr[i]; countSpO2++; }
+                    }
+                    rawBPM=(countBPM>0)?rawBPM/countBPM:0;
+                    rawSpO2=(countSpO2>0)?rawSpO2/countSpO2:0;
+
+                    if(rawBPM>=40 && rawBPM<=150) heartrate=smoothBPM(rawBPM);
+                    else heartrate=0;
+
+                    if(rawSpO2>=50 && rawSpO2<=100) pctspo2=smoothSpO2(rawSpO2);
+                    else pctspo2=0;
+
+                    beatFlag=true; // nhịp tim nhấp nháy
+                }
+            }
+
+            if(heartrate && lastmeastime+1.8<0.01*tcnt) finger_on_sensor=false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+/* ===== TASK: OLED DISPLAY ===== */
+void draw_data_task(void *pvParameters){
+    bool beatVisible=false;
+    while(1){
+        if(measuring && finger_on_sensor){
+            // nhấp nháy heart icon mỗi peak
+            static unsigned long lastBlink=0;
+            if(millis()-lastBlink>300){ beatVisible=!beatVisible; lastBlink=millis(); }
+            showStatus();
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/* ===== SETUP ===== */
+void setup(){
+    Serial.begin(115200);
+    max30102_init();
+    display_init();
+    setupNTP();
+    pinMode(BTN_PIN,INPUT_PULLUP);
+    pinMode(STATUS_LED_PIN,OUTPUT);
+    digitalWrite(STATUS_LED_PIN,LOW);
+
+    xTaskCreatePinnedToCore(max30102_task,"max30102_task",4096,NULL,5,NULL,1);
+    xTaskCreatePinnedToCore(draw_data_task,"draw_data_task",2048,NULL,5,NULL,1);
+}
+
+/* ===== LOOP ===== */
+void loop(){
+    if(digitalRead(BTN_PIN)==LOW && millis()-lastBtn>400){
+        lastBtn=millis();
+        measuring=!measuring;
+        digitalWrite(STATUS_LED_PIN, measuring?HIGH:LOW);
+    }
+}
+
+/* ===== NTP ===== */
+void setupNTP(){
+    WiFi.begin(ssid,password);
+    int attempt=0;
+    while(WiFi.status()!=WL_CONNECTED && attempt<20){ delay(500); attempt++; }
+    if(WiFi.status()==WL_CONNECTED) configTime(gmtOffset_sec,daylightOffset_sec,ntpServer);
+}
+
+/* ===== TIME ===== */
+void printLocalTime(uint8_t &hour,uint8_t &minute){
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo)) return;
+    hour=timeinfo.tm_hour;
+    minute=timeinfo.tm_min;
+}
+
+/* ===== OLED ICONS ===== */
+void drawBattery(uint8_t x,uint8_t y,uint8_t level){ display.drawRect(x,y+2,14,8,SSD1306_WHITE); display.drawRect(x+14,y+4,2,4,SSD1306_WHITE); display.fillRect(x+1,y+3,12*(level/100.0),6,SSD1306_WHITE);}
+void drawWifi(uint8_t x,uint8_t y){ display.drawPixel(x+4,y+8,SSD1306_WHITE); display.drawFastHLine(x+3,y+6,3,SSD1306_WHITE); display.drawFastHLine(x+1,y+4,7,SSD1306_WHITE);}
+void drawHeart(uint8_t x,uint8_t y, bool beat){ display.fillRect(x+1,y,2,2,SSD1306_WHITE); display.fillRect(x+5,y,2,2,SSD1306_WHITE); display.fillRect(x,y+2,8,2,SSD1306_WHITE); display.fillRect(x+1,y+4,6,2,SSD1306_WHITE); display.fillRect(x+2,y+6,4,2,SSD1306_WHITE); display.fillRect(x+3,y+8,2,2,SSD1306_WHITE); if(beat) display.fillRect(x+10,y+4,2,6,SSD1306_WHITE);}
+void drawO2Icon(uint8_t x,uint8_t y){ display.setTextSize(1); display.setCursor(x,y); display.print("O"); display.setCursor(x+8,y+4); display.print("2");}
+
+/* ===== SHOW STATUS ===== */
+void showStatus(){
+    printLocalTime(currentHour,currentMinute);
+    display.clearDisplay();
+
+    if(WiFi.status()==WL_CONNECTED) drawWifi(5,0);
+    drawBattery(SCREEN_WIDTH-20,0,75);
+    display.setTextSize(2); 
+    display.setCursor(40,10);
+    display.printf("%02d:%02d",currentHour,currentMinute);
+
+    drawHeart(10,34, true); // nhấp nháy theo task
+    display.setTextSize(2); 
+    display.setCursor(30,30);
+    if(heartrate>0) display.print((int)heartrate); else display.print("----");
+    display.setTextSize(1); display.setCursor(80,35); display.print("BPM");
+
+    drawO2Icon(10,50); 
+    display.setTextSize(2); 
+    display.setCursor(30,50);
+    if(pctspo2>0) display.print((int)pctspo2); else display.print("----");
+    display.setTextSize(1); display.setCursor(80,55); display.print("%");
+
+    display.display();
+}
