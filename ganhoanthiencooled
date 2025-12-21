@@ -152,6 +152,7 @@ float readTemperature() {
 }
 
 // ========== OLED DISPLAY ==========
+// ========== OLED DISPLAY ==========
 void updateDisplay() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -209,10 +210,14 @@ void updateDisplay() {
     display.print("No Finger");
   }
   
-  // Nhiệt độ
+  // Nhiệt độ - CHỈ HIỂN THỊ KHI CÓ NGÓN TAY
   display.setCursor(75, 57);
-  display.print(temperature, 1);
-  display.print("C");
+  if (fingerDetected) {
+    display.print(temperature, 1);
+    display.print("C");
+  } else {
+    display.print("--.-C");
+  }
   
   display.display();
 }
@@ -263,7 +268,21 @@ void measureVitals() {
       fingerLastSeen = millis();
     } else if (millis() - fingerLastSeen > 1000) {
       fingerDetected = false;
+      // RESET GIÁ TRỊ KHI KHÔNG CÓ NGÓN TAY
+      heartRate = 0;
+      spo2 = 0;
+      spo2Stable = 0;
+      hrcnt = 0;
+      // Xóa buffer
+      for (int i = 0; i < 10; i++) {
+        hrarr[i] = 0;
+        spo2arr[i] = 0;
+        bpmBuf[i] = 0;
+      }
     }
+    
+    // Chỉ xử lý khi có ngón tay
+    if (!fingerDetected) continue;
     
     // FIR Filter IR
     for (int i = 0; i < 4; i++) firxv[i] = firxv[i + 1];
@@ -460,52 +479,143 @@ void handleRoot() {
   html += "<title>MAX30102</title>";
   html += "<style>";
   html += "* { margin: 0; padding: 0; box-sizing: border-box; }";
-  html += "body { font-family: 'Segoe UI', Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 20px; min-height: 100vh; }";
-  html += ".container { max-width: 800px; margin: 0 auto; }";
-  html += "h1 { text-align: center; margin-bottom: 30px; font-size: 2em; }";
-  html += ".card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 25px; margin: 15px 0; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }";
-  html += ".status-card { display: flex; align-items: center; font-size: 1.2em; }";
-  html += ".status-indicator { width: 20px; height: 20px; border-radius: 50%; margin-right: 15px; animation: pulse 2s infinite; }";
+  html += "body { font-family: 'Segoe UI', Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; overflow: hidden; height: 100vh; }";
+  html += ".container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; height: 100vh; padding: 20px; }";
+  
+  // LEFT COLUMN - Thông số
+  html += ".left-col { display: flex; flex-direction: column; gap: 15px; }";
+  html += ".right-col { display: flex; flex-direction: column; gap: 15px; }";
+  html += "h1 { text-align: center; font-size: 1.8em; margin-bottom: 10px; grid-column: 1 / -1; }";
+  html += ".card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }";
+  
+  // Status card
+  html += ".status-card { display: flex; align-items: center; font-size: 1.1em; padding: 15px 20px; }";
+  html += ".status-indicator { width: 18px; height: 18px; border-radius: 50%; margin-right: 12px; animation: pulse 2s infinite; }";
   html += "@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }";
   html += ".ok { background: #0f0; box-shadow: 0 0 20px #0f0; }";
   html += ".error { background: #f00; box-shadow: 0 0 20px #f00; }";
-  html += ".metric-card { text-align: center; }";
-  html += ".metric-label { font-size: 1.2em; margin-bottom: 10px; }";
-  html += ".metric-value { font-size: 4em; font-weight: bold; margin: 15px 0; }";
-  html += ".metric-unit { font-size: 0.4em; }";
-  html += "button { flex: 1; min-width: 150px; background: rgba(255,255,255,0.2); color: white; border: 2px solid rgba(255,255,255,0.3); padding: 15px; border-radius: 12px; cursor: pointer; font-size: 1em; margin: 5px; }";
-  html += "button:hover { background: rgba(255,255,255,0.3); }";
+  
+  // Metric cards - Compact
+  html += ".metric-card { text-align: center; padding: 15px; }";
+  html += ".metric-label { font-size: 1em; margin-bottom: 8px; opacity: 0.9; }";
+  html += ".metric-value { font-size: 3em; font-weight: bold; margin: 10px 0; line-height: 1; }";
+  html += ".metric-unit { font-size: 0.35em; opacity: 0.8; }";
+  html += ".temp-card .metric-value { font-size: 2em; }";
+  
+  // History section
+  html += ".history-section { flex: 1; display: flex; flex-direction: column; overflow: hidden; }";
+  html += ".history-header { font-size: 1.2em; font-weight: bold; margin-bottom: 10px; text-align: center; }";
+  html += ".history-content { flex: 1; overflow-y: auto; font-size: 0.9em; line-height: 1.6; }";
+  html += ".history-content::-webkit-scrollbar { width: 8px; }";
+  html += ".history-content::-webkit-scrollbar-track { background: rgba(255,255,255,0.1); border-radius: 10px; }";
+  html += ".history-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.3); border-radius: 10px; }";
+  html += ".history-item { padding: 8px; border-bottom: 1px solid rgba(255,255,255,0.1); }";
+  html += ".no-data { text-align: center; padding: 20px; opacity: 0.6; }";
+  
+  // Buttons
+  html += ".btn-group { display: flex; gap: 10px; }";
+  html += "button { flex: 1; background: rgba(255,255,255,0.2); color: white; border: 2px solid rgba(255,255,255,0.3); padding: 12px; border-radius: 10px; cursor: pointer; font-size: 0.95em; transition: all 0.3s; }";
+  html += "button:hover { background: rgba(255,255,255,0.3); transform: translateY(-2px); }";
+  html += "button:active { transform: translateY(0); }";
+  
+  // Mobile responsive
+  html += "@media (max-width: 768px) {";
+  html += "  .container { grid-template-columns: 1fr; overflow-y: auto; height: auto; }";
+  html += "  .metric-value { font-size: 2.5em; }";
+  html += "}";
   html += "</style>";
+  
   html += "<script>";
+  html += "let historyData = [];";
+  html += "let statsData = null;";
+  
+  // Update main data
   html += "function updateData() {";
   html += "  fetch('/data').then(r => r.json()).then(d => {";
   html += "    document.getElementById('hr').innerHTML = d.hr > 0 ? d.hr : '--';";
   html += "    document.getElementById('spo2').innerHTML = d.spo2 > 0 ? d.spo2 : '--';";
-  html += "    document.getElementById('temp').innerHTML = d.temp.toFixed(1);";
+  html += "    document.getElementById('temp').innerHTML = d.finger ? d.temp.toFixed(1) : '--';";
   html += "    document.getElementById('status').className = 'status-indicator ' + (d.finger ? 'ok' : 'error');";
   html += "    document.getElementById('status-text').innerHTML = d.finger ? '✅ Đang đo' : '❌ Đặt ngón tay';";
   html += "    document.getElementById('hr').style.color = (d.hr >= 50 && d.hr <= 120) ? '#0f8' : '#fa0';";
   html += "    document.getElementById('spo2').style.color = d.spo2 >= 90 ? '#0f8' : '#f44';";
   html += "  });";
   html += "}";
+  
+  // Load history
+  html += "function showHistory() {";
+  html += "  document.getElementById('data-header').innerHTML = '📊 LỊCH SỬ';";
+  html += "  fetch('/history').then(r => r.text()).then(text => {";
+  html += "    const lines = text.split('\\n').filter(l => l.trim());";
+  html += "    if (lines.length <= 2 || text.includes('Chưa có')) {";
+  html += "      document.getElementById('data-content').innerHTML = '<div class=\"no-data\">Chưa có dữ liệu</div>';";
+  html += "      return;";
+  html += "    }";
+  html += "    let html = '';";
+  html += "    for (let i = 2; i < lines.length; i++) {";
+  html += "      html += '<div class=\"history-item\">' + lines[i] + '</div>';";
+  html += "    }";
+  html += "    document.getElementById('data-content').innerHTML = html;";
+  html += "  });";
+  html += "}";
+  
+html += "function showStats() {";
+html += "  document.getElementById('data-header').innerHTML = '📈 THỐNG KÊ';";
+html += "  fetch('/stats').then(r => r.text()).then(text => {";
+html += "    if (text.includes('Chưa có')) {";
+html += "      document.getElementById('data-content').innerHTML = '<div class=\"no-data\">Chưa có dữ liệu</div>';";
+html += "      return;";
+html += "    }";
+html += "    const lines = text.split('\\n').filter(l => l.trim());";
+html += "    let html = '';";
+html += "    for (let i = 0; i < lines.length; i++) {";  // ← ĐỔI TỪ 2 THÀNH 0
+html += "      html += '<div style=\"margin:8px 0\">' + lines[i] + '</div>';";
+html += "    }";
+html += "    document.getElementById('data-content').innerHTML = html;";
+html += "  });";
+html += "}";
+  
+  // Clear data
+  html += "function clearData() {";
+  html += "  if (confirm('Xóa tất cả dữ liệu?')) {";
+  html += "    fetch('/clear').then(r => r.text()).then(msg => {";
+  html += "      alert(msg);";
+  html += "      showHistory();";
+  html += "    });";
+  html += "  }";
+  html += "}";
+  
   html += "setInterval(updateData, 1000);";
+  html += "setInterval(() => {";
+  html += "  const header = document.getElementById('data-header').innerHTML;";
+  html += "  if (header.includes('LỊCH SỬ')) showHistory();";
+  html += "  else if (header.includes('THỐNG KÊ')) showStats();";
+  html += "}, 2000);";
   html += "updateData();";
+  html += "showHistory();";
   html += "</script>";
   html += "</head><body>";
+  
   html += "<div class='container'>";
-  html += "<h1>💓 THIẾT BỊ ĐO NHỊP TIM</h1>";
+  
+  // LEFT COLUMN
+  html += "<div class='left-col'>";
+  html += "<h1 style='grid-column: auto;'>💓 NHỊP TIM</h1>";
   html += "<div class='card status-card'><div id='status' class='status-indicator'></div><div id='status-text'>...</div></div>";
   html += "<div class='card metric-card'><div class='metric-label'>❤️ NHỊP TIM</div><div class='metric-value' id='hr'>--<span class='metric-unit'>BPM</span></div></div>";
   html += "<div class='card metric-card'><div class='metric-label'>🫁 SPO2</div><div class='metric-value' id='spo2'>--<span class='metric-unit'>%</span></div></div>";
-  html += "<div class='card metric-card'><div class='metric-label'>🌡️ NHIỆT ĐỘ</div><div class='metric-value' id='temp' style='font-size:2.5em'>--<span class='metric-unit'>°C</span></div></div>";
-  html += "<div class='card'>";
-  html += "<button onclick='fetch(\"/history\").then(r=>r.text()).then(alert)'>📊 Lịch sử</button>";
-  html += "<button onclick='fetch(\"/stats\").then(r=>r.text()).then(alert)'>📈 Thống kê</button>";
-  html += "<button onclick='if(confirm(\"Xóa?\")){fetch(\"/clear\").then(r=>r.text()).then(alert)}'>🗑️ Xóa</button>";
-  html += "</div></div></body></html>";
+  html += "<div class='card metric-card temp-card'><div class='metric-label'>🌡️ NHIỆT ĐỘ</div><div class='metric-value' id='temp'>--<span class='metric-unit'>°C</span></div></div>";
+  html += "</div>";
+  
+  // RIGHT COLUMN
+  html += "<div class='right-col'>";
+  html += "<div class='card'><div class='btn-group'><button onclick='showHistory()'>📊 Lịch sử</button><button onclick='showStats()'>📈 Thống kê</button><button onclick='clearData()'>🗑️ Xóa</button></div></div>";
+  html += "<div class='card history-section'><div class='history-header' id='data-header'>📊 LỊCH SỬ</div><div class='history-content' id='data-content'>Đang tải...</div></div>";
+  html += "</div>";
+  
+  html += "</div></body></html>";
   server.send(200, "text/html", html);
 }
-
 void handleData() {
   String json = "{\"hr\":" + String((int)heartRate) + ",\"spo2\":" + String((int)spo2) + ",\"temp\":" + String(temperature, 1) + ",\"finger\":" + (fingerDetected ? "true" : "false") + "}";
   server.send(200, "application/json", json);
