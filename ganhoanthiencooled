@@ -1,0 +1,600 @@
+/*
+ * ============================================
+ * MAX30102 - FIR FILTER + OLED + WEB
+ * Pure I2C - OLED SSD1306 0.96"
+ * ============================================
+ */
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ========== OLED ==========
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ========== WIFI ==========
+const char* ssid = "MU VO DICH";
+const char* password = "12344321";
+
+WebServer server(80);
+
+// ========== I2C ==========
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define I2C_ADDR 0x57
+
+// ========== FIR FILTER BUFFERS ==========
+float firxv[5] = {0};
+float firyv[5] = {0};
+float fredxv[5] = {0};
+float fredyv[5] = {0};
+
+// ========== MEASUREMENT ==========
+float hrarr[10] = {0};
+float spo2arr[10] = {0};
+int hrcnt = 0;
+float lastmeastime = 0;
+unsigned long tcnt = 0;
+
+float heartRate = 0;
+float spo2 = 0;
+float temperature = 36.5;
+bool fingerDetected = false;
+unsigned long fingerLastSeen = 0;
+
+// ========== SMOOTHING ==========
+float bpmBuf[10] = {0};
+uint8_t bpmIndex = 0;
+float spo2Stable = 0;
+
+// ========== LỊCH SỬ ==========
+#define HISTORY_SIZE 60
+float hrHistory[HISTORY_SIZE];
+float spo2History[HISTORY_SIZE];
+int historyIndex = 0;
+int historyCount = 0;
+
+// ========== CẢNH BÁO ==========
+int hrMin = 50;
+int hrMax = 120;
+int spo2Min = 90;
+
+// ========== LED ==========
+#define LED_R 10
+#define LED_G 3
+#define LED_B 4
+
+// ========== POWER ==========
+int irpower = 0x7F;  // Giảm từ 0xD0 xuống 0x7F
+int rpower = 0x7F;   // Giảm từ 0xA0 xuống 0x7F
+
+// ========== I2C FUNCTIONS ==========
+void i2c_write(uint8_t reg, uint8_t data) {
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(reg);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
+uint8_t i2c_read(uint8_t reg) {
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(I2C_ADDR, 1);
+  return Wire.read();
+}
+
+int read_fifo(uint8_t *buffer, int max_samples) {
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(0x04);
+  Wire.endTransmission(false);
+  Wire.requestFrom(I2C_ADDR, 3);
+  
+  uint8_t rptr = Wire.read();
+  uint8_t wptr = Wire.read();
+  Wire.read();
+  
+  int samp = ((32 + wptr) - rptr) % 32;
+  if (samp > max_samples) samp = max_samples;
+  if (samp == 0) return 0;
+  
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(0x07);
+  Wire.endTransmission(false);
+  Wire.requestFrom(I2C_ADDR, samp * 6);
+  
+  for (int i = 0; i < samp * 6; i++) {
+    buffer[i] = Wire.read();
+  }
+  
+  return samp;
+}
+
+// ========== INIT ==========
+void max30102_init() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  
+  i2c_write(0x08, 0x40);  // Reset
+  delay(100);
+  
+  i2c_write(0x09, 0x03);  // SpO2 mode
+  i2c_write(0x0A, (0x2 << 5) + (0x3 << 2) + 0x3);  // 100Hz, 411us, 4096
+  i2c_write(0x0C, irpower);
+  i2c_write(0x0D, rpower);
+  
+  delay(100);
+  
+  // Init FIR buffers
+  uint8_t regdata[6];
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(0x07);
+  Wire.endTransmission(false);
+  Wire.requestFrom(I2C_ADDR, 6);
+  for (int i = 0; i < 6; i++) regdata[i] = Wire.read();
+  
+  long irVal = ((regdata[0] & 0x03) * 65536 + regdata[1] * 256 + regdata[2]);
+  long redVal = ((regdata[3] & 0x03) * 65536 + regdata[4] * 256 + regdata[5]);
+  
+  for (int i = 0; i < 5; i++) {
+    firxv[i] = firyv[i] = irVal;
+    fredxv[i] = fredyv[i] = redVal;
+  }
+}
+
+float readTemperature() {
+  i2c_write(0x21, 0x01);
+  delay(30);
+  int8_t tempInt = (int8_t)i2c_read(0x1F);
+  uint8_t tempFrac = i2c_read(0x20);
+  return (float)tempInt + ((float)tempFrac * 0.0625);
+}
+
+// ========== OLED DISPLAY ==========
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Tiêu đề
+  display.setTextSize(1);
+  display.setCursor(25, 0);
+  display.print("MAX30102");
+  
+  // Vẽ đường kẻ
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  // Heart Rate
+  display.setTextSize(1);
+  display.setCursor(5, 15);
+  display.print("HR:");
+  
+  display.setTextSize(2);
+  display.setCursor(35, 13);
+  if (fingerDetected && heartRate > 0) {
+    display.print((int)heartRate);
+  } else {
+    display.print("--");
+  }
+  
+  display.setTextSize(1);
+  display.setCursor(95, 20);
+  display.print("BPM");
+  
+  // SpO2
+  display.setTextSize(1);
+  display.setCursor(5, 37);
+  display.print("SpO2:");
+  
+  display.setTextSize(2);
+  display.setCursor(45, 35);
+  if (fingerDetected && spo2 > 0) {
+    display.print((int)spo2);
+  } else {
+    display.print("--");
+  }
+  
+  display.setTextSize(1);
+  display.setCursor(95, 42);
+  display.print("%");
+  
+  // Status bar dưới
+  display.drawLine(0, 54, 128, 54, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(5, 57);
+  if (fingerDetected) {
+    display.print("OK");
+  } else {
+    display.print("No Finger");
+  }
+  
+  // Nhiệt độ
+  display.setCursor(75, 57);
+  display.print(temperature, 1);
+  display.print("C");
+  
+  display.display();
+}
+
+// ========== OLED ICONS (tùy chọn) ==========
+void drawHeart(int x, int y) {
+  display.fillCircle(x, y, 3, SSD1306_WHITE);
+  display.fillCircle(x + 6, y, 3, SSD1306_WHITE);
+  display.fillTriangle(x - 3, y + 1, x + 9, y + 1, x + 3, y + 8, SSD1306_WHITE);
+}
+
+// ========== SMOOTHING ==========
+float smoothBPM(float newBPM) {
+  if (newBPM <= 0) return (heartRate > 0) ? heartRate : 0;
+  
+  bpmBuf[bpmIndex] = newBPM;
+  bpmIndex = (bpmIndex + 1) % 10;
+  
+  float sum = 0;
+  int count = 0;
+  for (int i = 0; i < 10; i++) {
+    if (bpmBuf[i] > 0) {
+      sum += bpmBuf[i];
+      count++;
+    }
+  }
+  return (count > 0) ? sum / count : 0;
+}
+
+float smoothSpO2(float newSpO2) {
+  if (newSpO2 <= 0) return spo2Stable;
+  if (spo2Stable == 0) spo2Stable = newSpO2;
+  else spo2Stable = 0.3 * newSpO2 + 0.7 * spo2Stable;
+  return spo2Stable;
+}
+
+// ========== MEASURE ==========
+void measureVitals() {
+  uint8_t regdata[192];
+  int samp = read_fifo(regdata, 32);
+  
+  for (int cnt = 0; cnt < samp; cnt++) {
+    float meastime = 0.01 * tcnt++;
+    
+    long irValue = ((regdata[6 * cnt + 0] & 0x03) * 65536 + 
+                    regdata[6 * cnt + 1] * 256 + 
+                    regdata[6 * cnt + 2]);
+    long redValue = ((regdata[6 * cnt + 3] & 0x03) * 65536 + 
+                     regdata[6 * cnt + 4] * 256 + 
+                     regdata[6 * cnt + 5]);
+    
+    // Phát hiện ngón tay
+    if (irValue > 50000) {
+      fingerDetected = true;
+      fingerLastSeen = millis();
+    } else if (millis() - fingerLastSeen > 1000) {
+      fingerDetected = false;
+    }
+    
+    // FIR Filter IR
+    for (int i = 0; i < 4; i++) firxv[i] = firxv[i + 1];
+    firxv[4] = (1.0 / 3.48311) * irValue;
+    
+    for (int i = 0; i < 4; i++) firyv[i] = firyv[i + 1];
+    firyv[4] = (firxv[0] + firxv[4]) - 2 * firxv[2] +
+               (-0.1718123813 * firyv[0]) +
+               (0.3686645260 * firyv[1]) +
+               (-1.1718123813 * firyv[2]) +
+               (1.9738037992 * firyv[3]);
+    
+    // FIR Filter Red
+    for (int i = 0; i < 4; i++) fredxv[i] = fredxv[i + 1];
+    fredxv[4] = (1.0 / 3.48311) * redValue;
+    
+    for (int i = 0; i < 4; i++) fredyv[i] = fredyv[i + 1];
+    fredyv[4] = (fredxv[0] + fredxv[4]) - 2 * fredxv[2] +
+                (-0.1718123813 * fredyv[0]) +
+                (0.3686645260 * fredyv[1]) +
+                (-1.1718123813 * fredyv[2]) +
+                (1.9738037992 * fredyv[3]);
+    
+    // Peak Detection - QUAN TRỌNG: Giảm ngưỡng xuống
+    if (-1.0 * firyv[4] >= 50 &&  // Giảm từ 100 xuống 50
+        -1.0 * firyv[2] > -1.0 * firyv[0] &&
+        -1.0 * firyv[2] > -1.0 * firyv[4]) {
+      
+      // Minimum 0.5s between peaks (120 BPM max)
+      if (meastime - lastmeastime < 0.5) continue;
+      
+      // Maximum 2s between peaks (30 BPM min)
+      if (meastime - lastmeastime > 2.0) {
+        lastmeastime = meastime;
+        continue;
+      }
+      
+      float bpm = 60.0 / (meastime - lastmeastime);
+      
+      // VALIDATION: Chỉ chấp nhận 40-140 BPM
+      if (bpm < 40 || bpm > 140) {
+        lastmeastime = meastime;
+        continue;
+      }
+      
+      hrarr[hrcnt % 10] = bpm;
+      
+      // SpO2 calculation
+      float R = (fredyv[4] / fredxv[4]) / (firyv[4] / firxv[4]);
+      float spo2val = 110.0 - 25.0 * R;
+      if (spo2val > 100) spo2val = 99.9;
+      if (spo2val < 0) spo2val = 0;
+      
+      spo2arr[hrcnt % 10] = spo2val;
+      
+      lastmeastime = meastime;
+      hrcnt++;
+      
+      // Calculate average after 5 measurements
+      if (hrcnt >= 5) {
+        float rawBPM = 0, rawSpO2 = 0;
+        int countBPM = 0, countSpO2 = 0;
+        
+        for (int i = 0; i < 10; i++) {
+          if (hrarr[i] > 0) {
+            rawBPM += hrarr[i];
+            countBPM++;
+          }
+          if (spo2arr[i] > 0) {
+            rawSpO2 += spo2arr[i];
+            countSpO2++;
+          }
+        }
+        
+        rawBPM = (countBPM > 0) ? rawBPM / countBPM : 0;
+        rawSpO2 = (countSpO2 > 0) ? rawSpO2 / countSpO2 : 0;
+        
+        if (rawBPM >= 40 && rawBPM <= 140) {
+          heartRate = smoothBPM(rawBPM);
+        }
+        
+        if (rawSpO2 >= 70 && rawSpO2 <= 100) {
+          spo2 = smoothSpO2(rawSpO2);
+        }
+      }
+    }
+    
+    // Timeout check
+    if (heartRate && lastmeastime + 2.0 < 0.01 * tcnt) {
+      fingerDetected = false;
+    }
+  }
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  analogWrite(LED_R, 0);
+  analogWrite(LED_G, 0);
+  analogWrite(LED_B, 255);
+  
+  // Khởi động OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED Error!");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(20, 25);
+    display.print("MAX30102");
+    display.setCursor(15, 40);
+    display.print("Starting...");
+    display.display();
+    delay(1000);
+  }
+  
+  // Khởi động MAX30102
+  max30102_init();
+  
+  // Kết nối WiFi
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.print("Connecting WiFi");
+  display.display();
+  
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP: http://");
+    Serial.println(WiFi.localIP());
+    
+    display.clearDisplay();
+    display.setCursor(0, 10);
+    display.print("WiFi Connected!");
+    display.setCursor(0, 25);
+    display.print("IP:");
+    display.setCursor(0, 40);
+    display.print(WiFi.localIP());
+    display.display();
+    delay(2000);
+    
+    setupWebServer();
+    server.begin();
+    analogWrite(LED_R, 0);
+    analogWrite(LED_G, 255);
+    analogWrite(LED_B, 0);
+  } else {
+    Serial.println("No WiFi");
+    display.clearDisplay();
+    display.setCursor(0, 25);
+    display.print("No WiFi");
+    display.display();
+    delay(2000);
+  }
+}
+
+// ========== LOOP ==========
+void loop() {
+  server.handleClient();
+  
+  measureVitals();
+  
+  static unsigned long lastTempRead = 0;
+  if (millis() - lastTempRead > 1000) {
+    temperature = readTemperature();
+    lastTempRead = millis();
+  }
+  
+  saveToHistory();
+  updateStatusLED();
+  
+  // Cập nhật OLED mỗi 500ms
+  static unsigned long lastOledUpdate = 0;
+  if (millis() - lastOledUpdate > 500) {
+    updateDisplay();
+    lastOledUpdate = millis();
+  }
+  
+  delay(10);  // QUAN TRỌNG: 10ms để đạt 100Hz sampling
+}
+
+// ========== WEB SERVER ==========
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/history", HTTP_GET, handleHistory);
+  server.on("/stats", HTTP_GET, handleStats);
+  server.on("/clear", HTTP_GET, handleClear);
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>MAX30102</title>";
+  html += "<style>";
+  html += "* { margin: 0; padding: 0; box-sizing: border-box; }";
+  html += "body { font-family: 'Segoe UI', Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 20px; min-height: 100vh; }";
+  html += ".container { max-width: 800px; margin: 0 auto; }";
+  html += "h1 { text-align: center; margin-bottom: 30px; font-size: 2em; }";
+  html += ".card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 25px; margin: 15px 0; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }";
+  html += ".status-card { display: flex; align-items: center; font-size: 1.2em; }";
+  html += ".status-indicator { width: 20px; height: 20px; border-radius: 50%; margin-right: 15px; animation: pulse 2s infinite; }";
+  html += "@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }";
+  html += ".ok { background: #0f0; box-shadow: 0 0 20px #0f0; }";
+  html += ".error { background: #f00; box-shadow: 0 0 20px #f00; }";
+  html += ".metric-card { text-align: center; }";
+  html += ".metric-label { font-size: 1.2em; margin-bottom: 10px; }";
+  html += ".metric-value { font-size: 4em; font-weight: bold; margin: 15px 0; }";
+  html += ".metric-unit { font-size: 0.4em; }";
+  html += "button { flex: 1; min-width: 150px; background: rgba(255,255,255,0.2); color: white; border: 2px solid rgba(255,255,255,0.3); padding: 15px; border-radius: 12px; cursor: pointer; font-size: 1em; margin: 5px; }";
+  html += "button:hover { background: rgba(255,255,255,0.3); }";
+  html += "</style>";
+  html += "<script>";
+  html += "function updateData() {";
+  html += "  fetch('/data').then(r => r.json()).then(d => {";
+  html += "    document.getElementById('hr').innerHTML = d.hr > 0 ? d.hr : '--';";
+  html += "    document.getElementById('spo2').innerHTML = d.spo2 > 0 ? d.spo2 : '--';";
+  html += "    document.getElementById('temp').innerHTML = d.temp.toFixed(1);";
+  html += "    document.getElementById('status').className = 'status-indicator ' + (d.finger ? 'ok' : 'error');";
+  html += "    document.getElementById('status-text').innerHTML = d.finger ? '✅ Đang đo' : '❌ Đặt ngón tay';";
+  html += "    document.getElementById('hr').style.color = (d.hr >= 50 && d.hr <= 120) ? '#0f8' : '#fa0';";
+  html += "    document.getElementById('spo2').style.color = d.spo2 >= 90 ? '#0f8' : '#f44';";
+  html += "  });";
+  html += "}";
+  html += "setInterval(updateData, 1000);";
+  html += "updateData();";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>💓 THIẾT BỊ ĐO NHỊP TIM</h1>";
+  html += "<div class='card status-card'><div id='status' class='status-indicator'></div><div id='status-text'>...</div></div>";
+  html += "<div class='card metric-card'><div class='metric-label'>❤️ NHỊP TIM</div><div class='metric-value' id='hr'>--<span class='metric-unit'>BPM</span></div></div>";
+  html += "<div class='card metric-card'><div class='metric-label'>🫁 SPO2</div><div class='metric-value' id='spo2'>--<span class='metric-unit'>%</span></div></div>";
+  html += "<div class='card metric-card'><div class='metric-label'>🌡️ NHIỆT ĐỘ</div><div class='metric-value' id='temp' style='font-size:2.5em'>--<span class='metric-unit'>°C</span></div></div>";
+  html += "<div class='card'>";
+  html += "<button onclick='fetch(\"/history\").then(r=>r.text()).then(alert)'>📊 Lịch sử</button>";
+  html += "<button onclick='fetch(\"/stats\").then(r=>r.text()).then(alert)'>📈 Thống kê</button>";
+  html += "<button onclick='if(confirm(\"Xóa?\")){fetch(\"/clear\").then(r=>r.text()).then(alert)}'>🗑️ Xóa</button>";
+  html += "</div></div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  String json = "{\"hr\":" + String((int)heartRate) + ",\"spo2\":" + String((int)spo2) + ",\"temp\":" + String(temperature, 1) + ",\"finger\":" + (fingerDetected ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() {
+  String result = "LỊCH SỬ (" + String(historyCount) + ")\n\n";
+  if (historyCount == 0) result = "Chưa có dữ liệu!";
+  else {
+    for (int i = 0; i < historyCount; i++) {
+      result += String(i + 1) + ". " + String((int)hrHistory[i]) + " BPM | " + String((int)spo2History[i]) + "%\n";
+    }
+  }
+  server.send(200, "text/plain; charset=utf-8", result);
+}
+
+void handleStats() {
+  if (historyCount == 0) {
+    server.send(200, "text/plain", "Chưa có dữ liệu!");
+    return;
+  }
+  float hrMin = 999, hrMax = 0, hrSum = 0, spo2Min = 999, spo2Max = 0, spo2Sum = 0;
+  int hrCount = 0, spo2Count = 0;
+  for (int i = 0; i < historyCount; i++) {
+    if (hrHistory[i] > 0) {
+      if (hrHistory[i] < hrMin) hrMin = hrHistory[i];
+      if (hrHistory[i] > hrMax) hrMax = hrHistory[i];
+      hrSum += hrHistory[i];
+      hrCount++;
+    }
+    if (spo2History[i] > 0) {
+      if (spo2History[i] < spo2Min) spo2Min = spo2History[i];
+      if (spo2History[i] > spo2Max) spo2Max = spo2History[i];
+      spo2Sum += spo2History[i];
+      spo2Count++;
+    }
+  }
+  String result = "THỐNG KÊ\n\nHR: TB=" + String((int)(hrSum / hrCount)) + " Min=" + String((int)hrMin) + " Max=" + String((int)hrMax) + "\n";
+  result += "SpO2: TB=" + String((int)(spo2Sum / spo2Count)) + " Min=" + String((int)spo2Min) + " Max=" + String((int)spo2Max);
+  server.send(200, "text/plain; charset=utf-8", result);
+}
+
+void handleClear() {
+  historyCount = 0;
+  historyIndex = 0;
+  server.send(200, "text/plain", "Đã xóa!");
+}
+
+void saveToHistory() {
+  static unsigned long lastSave = 0;
+  if (millis() - lastSave < 5000) return;
+  lastSave = millis();
+  if (fingerDetected && heartRate > 0 && spo2 > 0) {
+    hrHistory[historyIndex] = heartRate;
+    spo2History[historyIndex] = spo2;
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+    if (historyCount < HISTORY_SIZE) historyCount++;
+  }
+}
+
+void updateStatusLED() {
+  if (!fingerDetected) {
+    analogWrite(LED_R, 255); analogWrite(LED_G, 0); analogWrite(LED_B, 0);
+  } else if ((heartRate > 0 && (heartRate < hrMin || heartRate > hrMax)) || (spo2 > 0 && spo2 < spo2Min)) {
+    analogWrite(LED_R, 255); analogWrite(LED_G, 165); analogWrite(LED_B, 0);
+  } else {
+    analogWrite(LED_R, 0); analogWrite(LED_G, 255); analogWrite(LED_B, 0);
+  }
+}
