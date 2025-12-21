@@ -72,8 +72,8 @@ int hrMax = 120;
 int spo2Min = 90;
 
 // ========== POWER ==========
-int irpower = 0x7F;  // Giảm từ 0xD0 xuống 0x7F
-int rpower = 0x7F;   // Giảm từ 0xA0 xuống 0x7F
+int irpower = 0x7F;
+int rpower  = 0x7F;
 
 // ========== I2C FUNCTIONS ==========
 void i2c_write(uint8_t reg, uint8_t data) {
