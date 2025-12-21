@@ -450,7 +450,9 @@ void setup() {
 // ========== LOOP ==========
 void loop() {
   server.handleClient();
-  
+  Blynk.run();
+  sendToBlynk();
+
   measureVitals();
   
   static unsigned long lastTempRead = 0;
