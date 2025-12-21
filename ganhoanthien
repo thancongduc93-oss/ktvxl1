@@ -1,0 +1,698 @@
+/*
+ * ============================================
+ * THIẾT BỊ ĐO NHỊP TIM VÀ SPO2 - MAX30102
+ * ESP32-C3 + MAX30102 + Web Dashboard
+ * THUẬT TOÁN FIR FILTER NÂNG CAO
+ * ============================================
+ */
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ========== CẤU HÌNH WIFI ==========
+const char* ssid = "MU VO DICH";
+const char* password = "12344321";
+
+// ========== KHỞI TẠO WEB SERVER ==========
+WebServer server(80);
+
+// ========== BIẾN ĐO ==========
+float heartRate = 0;
+float spo2 = 0;
+float temperature = 0;
+bool fingerDetected = false;
+
+// ========== FIR FILTER BUFFERS ==========
+float firxv[5] = {0};  // IR FIR input buffer
+float firyv[5] = {0};  // IR FIR output buffer
+float fredxv[5] = {0}; // Red FIR input buffer
+float fredyv[5] = {0}; // Red FIR output buffer
+
+// ========== HEARTRATE MEASUREMENT ==========
+float hrarr[10] = {0};      // Buffer lưu 10 lần đo gần nhất
+float spo2arr[10] = {0};    // Buffer lưu 10 giá trị SpO2
+int hrcnt = 0;              // Đếm số lần đo
+float lastmeastime = 0;     // Thời điểm đo cuối
+unsigned long tcnt = 0;     // Bộ đếm thời gian (0.01s mỗi sample)
+unsigned long fingerLastSeen = 0; // Lần cuối thấy ngón tay
+
+// ========== SMOOTHING BUFFERS ==========
+#define BPM_BUF_SIZE 10
+float bpmBuf[BPM_BUF_SIZE] = {0};
+uint8_t bpmIndex = 0;
+float spo2Stable = 0;
+
+// ========== LƯU LỊCH SỬ (60 LẦN ĐO) ==========
+#define HISTORY_SIZE 60
+float hrHistory[HISTORY_SIZE];
+float spo2History[HISTORY_SIZE];
+int historyIndex = 0;
+int historyCount = 0;
+
+// ========== CÀI ĐẶT CẢNH BÁO ==========
+bool alertEnabled = true;
+int hrMin = 50;
+int hrMax = 120;
+int spo2Min = 90;
+
+// ========== LED RGB PINS ==========
+#define LED_R 10
+#define LED_G 3
+#define LED_B 4
+
+// ========== I2C CONFIGURATION ==========
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define I2C_ADDR_MAX30102 0x57
+
+// ========== POWER SETTINGS ==========
+int irpower = 0xD0;   // IR LED power
+int rpower = 0xA0;    // Red LED power
+int lirpower = 0;
+int lrpower = 0;
+
+// ========== FUNCTION PROTOTYPES ==========
+void max30102_init_custom();
+void i2c_write(uint8_t reg, uint8_t data);
+int read_fifo(uint8_t *buffer, int max_samples);
+void measureVitals_FIR();
+float smoothBPM(float newBPM);
+float smoothSpO2(float newSpO2);
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║   MAX30102 - FIR FILTER ALGORITHM     ║");
+  Serial.println("║   ESP32-C3 + Web Dashboard             ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+  
+  // Setup LED RGB
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  setLED(0, 0, 255);
+  
+  Serial.println("🔧 Khởi động I2C...");
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(800000); // 800kHz high speed
+  
+  Serial.println("🔧 Khởi tạo MAX30102 với FIR Filter...");
+  max30102_init_custom();
+  
+  Serial.println("✅ MAX30102 đã sẵn sàng với FIR Filter!");
+  
+  // Kết nối WiFi
+  Serial.println("\n📡 Đang kết nối WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ WiFi đã kết nối!");
+    Serial.print("📱 Địa chỉ IP: http://");
+    Serial.println(WiFi.localIP());
+    
+    setupWebServer();
+    server.begin();
+    setLED(0, 255, 0);
+  } else {
+    Serial.println("⚠️  Không kết nối được WiFi");
+    setLED(255, 255, 0);
+  }
+  
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║  🩺 ĐẶT NGÓN TAY LÊN CẢM BIẾN         ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+}
+
+// ========== LOOP ==========
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
+  
+  // Đo với thuật toán FIR Filter
+  measureVitals_FIR();
+  
+  // Đọc nhiệt độ (giả lập - MAX30102 có cảm biến nhiệt độ nhưng cần đọc từ register 0x1F-0x20)
+  // Bạn có thể bỏ qua hoặc đọc từ register nếu cần
+  static float tempSimulated = 36.5;
+  temperature = tempSimulated;
+  
+  // Lưu lịch sử
+  saveToHistory();
+  
+  // Kiểm tra cảnh báo
+  checkAlerts();
+  
+  // Cập nhật LED
+  updateStatusLED();
+  
+  // In kết quả
+  printResults();
+  
+  delay(20); // 20ms delay cho sampling rate ~50Hz
+}
+
+// ========== I2C WRITE ==========
+void i2c_write(uint8_t reg, uint8_t data) {
+  Wire.beginTransmission(I2C_ADDR_MAX30102);
+  Wire.write(reg);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
+// ========== INIT MAX30102 CUSTOM ==========
+void max30102_init_custom() {
+  // Reset
+  i2c_write(0x08, 0x40);
+  delay(100);
+  
+  // Mode Configuration (SpO2 mode)
+  i2c_write(0x09, 0x03);
+  
+  // SPO2 Configuration
+  // bit[6:5] = 11 (sample rate 100Hz)
+  // bit[4:2] = 011 (LED pulse width 411μs)
+  // bit[1:0] = 11 (ADC range 4096)
+  i2c_write(0x0A, (0x3 << 5) + (0x3 << 2) + 0x3);
+  
+  // LED Pulse Amplitude
+  i2c_write(0x0C, irpower);  // IR LED
+  i2c_write(0x0D, rpower);   // Red LED
+  
+  delay(100);
+  
+  // Initialize FIR buffers với giá trị thực
+  uint8_t regdata[6];
+  Wire.beginTransmission(I2C_ADDR_MAX30102);
+  Wire.write(0x07);
+  Wire.endTransmission(false);
+  Wire.requestFrom(I2C_ADDR_MAX30102, 6);
+  for (int i = 0; i < 6; i++) {
+    regdata[i] = Wire.read();
+  }
+  
+  long irVal = ((regdata[0] & 0x03) * 65536 + regdata[1] * 256 + regdata[2]);
+  long redVal = ((regdata[3] & 0x03) * 65536 + regdata[4] * 256 + regdata[5]);
+  
+  // Khởi tạo FIR filter với giá trị ban đầu
+  for (int i = 0; i < 5; i++) {
+    firxv[i] = firyv[i] = irVal;
+    fredxv[i] = fredyv[i] = redVal;
+  }
+  
+  Serial.println("✅ FIR Filter buffers initialized");
+  Serial.print("   Initial IR: "); Serial.println(irVal);
+  Serial.print("   Initial Red: "); Serial.println(redVal);
+}
+
+// ========== READ FIFO ==========
+int read_fifo(uint8_t *buffer, int max_samples) {
+  // Đọc read/write pointers
+  Wire.beginTransmission(I2C_ADDR_MAX30102);
+  Wire.write(0x04);
+  Wire.endTransmission(false);
+  Wire.requestFrom(I2C_ADDR_MAX30102, 3);
+  
+  uint8_t rptr = Wire.read();
+  uint8_t wptr = Wire.read();
+  Wire.read(); // overflow counter
+  
+  // Tính số samples available
+  int samp = ((32 + wptr) - rptr) % 32;
+  if (samp > max_samples) samp = max_samples;
+  
+  if (samp == 0) return 0;
+  
+  // Đọc FIFO data
+  Wire.beginTransmission(I2C_ADDR_MAX30102);
+  Wire.write(0x07);
+  Wire.endTransmission(false);
+  Wire.requestFrom(I2C_ADDR_MAX30102, samp * 6);
+  
+  for (int i = 0; i < samp * 6; i++) {
+    buffer[i] = Wire.read();
+  }
+  
+  return samp;
+}
+
+// ========== MEASURE VITALS WITH FIR FILTER ==========
+void measureVitals_FIR() {
+  uint8_t regdata[192]; // Buffer for 32 samples * 6 bytes
+  
+  // Cập nhật LED power nếu thay đổi
+  if (lirpower != irpower) {
+    i2c_write(0x0C, irpower);
+    lirpower = irpower;
+  }
+  if (lrpower != rpower) {
+    i2c_write(0x0D, rpower);
+    lrpower = rpower;
+  }
+  
+  // Đọc FIFO
+  int samp = read_fifo(regdata, 32);
+  
+  // Xử lý từng sample
+  for (int cnt = 0; cnt < samp; cnt++) {
+    float meastime = 0.01 * tcnt++;
+    
+    // Parse IR và Red values (18-bit)
+    long irValue = ((regdata[6 * cnt + 0] & 0x03) * 65536 + 
+                    regdata[6 * cnt + 1] * 256 + 
+                    regdata[6 * cnt + 2]);
+    long redValue = ((regdata[6 * cnt + 3] & 0x03) * 65536 + 
+                     regdata[6 * cnt + 4] * 256 + 
+                     regdata[6 * cnt + 5]);
+    
+    // Phát hiện ngón tay
+    if (irValue > 20000) {
+      fingerDetected = true;
+      fingerLastSeen = millis();
+    } else if (millis() - fingerLastSeen > 1000) {
+      fingerDetected = false;
+    }
+    
+    // ===== FIR FILTER CHO IR =====
+    // Shift buffer
+    for (int i = 0; i < 4; i++) firxv[i] = firxv[i + 1];
+    firxv[4] = (1 / 3.48311) * irValue;
+    
+    for (int i = 0; i < 4; i++) firyv[i] = firyv[i + 1];
+    firyv[4] = (firxv[0] + firxv[4]) - 2 * firxv[2] +
+               (-0.1718123813 * firyv[0]) +
+               (0.3686645260 * firyv[1]) +
+               (-1.1718123813 * firyv[2]) +
+               (1.9738037992 * firyv[3]);
+    
+    // ===== FIR FILTER CHO RED =====
+    for (int i = 0; i < 4; i++) fredxv[i] = fredxv[i + 1];
+    fredxv[4] = (1 / 3.48311) * redValue;
+    
+    for (int i = 0; i < 4; i++) fredyv[i] = fredyv[i + 1];
+    fredyv[4] = (fredxv[0] + fredxv[4]) - 2 * fredxv[2] +
+                (-0.1718123813 * fredyv[0]) +
+                (0.3686645260 * fredyv[1]) +
+                (-1.1718123813 * fredyv[2]) +
+                (1.9738037992 * fredyv[3]);
+    
+    // ===== PEAK DETECTION =====
+    // Phát hiện peak: giá trị âm của FIR output vượt ngưỡng và là local maximum
+    if (-1.0 * firyv[4] >= 100 &&
+        -1.0 * firyv[2] > -1 * firyv[0] &&
+        -1.0 * firyv[2] > -1 * firyv[4]) {
+      
+      // Bỏ qua nếu quá gần lần đo trước (< 0.5s)
+      if (meastime - lastmeastime < 0.5) continue;
+      
+      // Tính Heart Rate từ khoảng cách giữa 2 peaks
+      hrarr[hrcnt % 10] = 60 / (meastime - lastmeastime);
+      
+      // Tính SpO2 bằng R-value method
+      // SpO2 = 110 - 25 * R, với R = (AC_red/DC_red) / (AC_ir/DC_ir)
+      float R = (fredyv[4] / fredxv[4]) / (firyv[4] / firxv[4]);
+      spo2arr[hrcnt % 10] = 110 - 25 * R;
+      
+      if (spo2arr[hrcnt % 10] > 100) spo2arr[hrcnt % 10] = 99.9;
+      
+      lastmeastime = meastime;
+      hrcnt++;
+      
+      // Sau 5 lần đo, bắt đầu tính trung bình
+      if (hrcnt >= 5) {
+        float rawBPM = 0, rawSpO2 = 0;
+        int countBPM = 0, countSpO2 = 0;
+        
+        // Tính trung bình từ 10 giá trị gần nhất
+        for (int i = 0; i < 10; i++) {
+          if (hrarr[i] > 0) {
+            rawBPM += hrarr[i];
+            countBPM++;
+          }
+          if (spo2arr[i] > 0) {
+            rawSpO2 += spo2arr[i];
+            countSpO2++;
+          }
+        }
+        
+        rawBPM = (countBPM > 0) ? rawBPM / countBPM : 0;
+        rawSpO2 = (countSpO2 > 0) ? rawSpO2 / countSpO2 : 0;
+        
+        // Lọc giá trị hợp lệ và smooth
+        if (rawBPM >= 40 && rawBPM <= 150) {
+          heartRate = smoothBPM(rawBPM);
+        } else {
+          heartRate = 0;
+        }
+        
+        if (rawSpO2 >= 50 && rawSpO2 <= 100) {
+          spo2 = smoothSpO2(rawSpO2);
+        } else {
+          spo2 = 0;
+        }
+      }
+    }
+    
+    // Timeout: nếu không có heart beat trong 1.8s thì coi như mất ngón tay
+    if (heartRate && lastmeastime + 1.8 < 0.01 * tcnt) {
+      fingerDetected = false;
+    }
+  }
+}
+
+// ========== SMOOTH BPM ==========
+float smoothBPM(float newBPM) {
+  if (newBPM <= 0) return (heartRate > 0) ? heartRate : 0;
+  
+  bpmBuf[bpmIndex] = newBPM;
+  bpmIndex = (bpmIndex + 1) % BPM_BUF_SIZE;
+  
+  float sum = 0;
+  uint8_t count = 0;
+  
+  for (uint8_t i = 0; i < BPM_BUF_SIZE; i++) {
+    if (bpmBuf[i] > 0) {
+      sum += bpmBuf[i];
+      count++;
+    }
+  }
+  
+  return (count > 0) ? sum / count : 0;
+}
+
+// ========== SMOOTH SPO2 ==========
+float smoothSpO2(float newSpO2) {
+  if (newSpO2 <= 0) return spo2Stable;
+  
+  if (spo2Stable == 0) {
+    spo2Stable = newSpO2;
+  } else {
+    spo2Stable = 0.3 * newSpO2 + 0.7 * spo2Stable; // EMA filter
+  }
+  
+  return spo2Stable;
+}
+
+// ========== WEB SERVER ==========
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/history", HTTP_GET, handleHistory);
+  server.on("/stats", HTTP_GET, handleStats);
+  server.on("/clear", HTTP_GET, handleClear);
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>MAX30102 - FIR Algorithm</title>";
+  html += "<style>";
+  html += "* { margin: 0; padding: 0; box-sizing: border-box; }";
+  html += "body { font-family: 'Segoe UI', Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 20px; min-height: 100vh; }";
+  html += ".container { max-width: 800px; margin: 0 auto; }";
+  html += "h1 { text-align: center; margin-bottom: 30px; font-size: 2em; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }";
+  html += ".card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 25px; margin: 15px 0; box-shadow: 0 8px 32px rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); }";
+  html += ".status-card { display: flex; align-items: center; font-size: 1.2em; }";
+  html += ".status-indicator { width: 20px; height: 20px; border-radius: 50%; margin-right: 15px; animation: pulse 2s infinite; }";
+  html += "@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }";
+  html += ".ok { background: #00ff00; box-shadow: 0 0 20px #00ff00; }";
+  html += ".warning { background: #ffaa00; box-shadow: 0 0 20px #ffaa00; }";
+  html += ".error { background: #ff0000; box-shadow: 0 0 20px #ff0000; }";
+  html += ".metric-card { text-align: center; }";
+  html += ".metric-label { font-size: 1.2em; margin-bottom: 10px; opacity: 0.9; }";
+  html += ".metric-value { font-size: 4em; font-weight: bold; margin: 15px 0; text-shadow: 2px 2px 8px rgba(0,0,0,0.3); transition: color 0.3s; }";
+  html += ".metric-unit { font-size: 0.4em; opacity: 0.8; }";
+  html += ".button-group { display: flex; gap: 10px; flex-wrap: wrap; }";
+  html += "button { flex: 1; min-width: 150px; background: rgba(255,255,255,0.2); color: white; border: 2px solid rgba(255,255,255,0.3); padding: 15px 20px; border-radius: 12px; cursor: pointer; font-size: 1em; font-weight: bold; transition: all 0.3s; }";
+  html += "button:hover { background: rgba(255,255,255,0.3); transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.3); }";
+  html += ".footer { text-align: center; margin-top: 30px; font-size: 0.9em; opacity: 0.7; }";
+  html += ".algorithm-badge { background: rgba(0,255,136,0.2); padding: 5px 10px; border-radius: 5px; font-size: 0.8em; display: inline-block; margin-top: 10px; }";
+  html += "</style>";
+  html += "<script>";
+  html += "function updateData() {";
+  html += "  fetch('/data').then(r => r.json()).then(d => {";
+  html += "    document.getElementById('hr').innerHTML = d.hr > 0 ? d.hr : '--';";
+  html += "    document.getElementById('spo2').innerHTML = d.spo2 > 0 ? d.spo2 : '--';";
+  html += "    document.getElementById('temp').innerHTML = d.temp;";
+  html += "    const statusEl = document.getElementById('status');";
+  html += "    const statusText = document.getElementById('status-text');";
+  html += "    if (d.finger) {";
+  html += "      statusEl.className = 'status-indicator ok';";
+  html += "      statusText.innerHTML = '✅ Ngón tay đã đặt đúng';";
+  html += "    } else {";
+  html += "      statusEl.className = 'status-indicator error';";
+  html += "      statusText.innerHTML = '❌ Vui lòng đặt ngón tay';";
+  html += "    }";
+  html += "    const hrEl = document.getElementById('hr');";
+  html += "    if (d.hr > 0) {";
+  html += "      hrEl.style.color = (d.hr >= 50 && d.hr <= 120) ? '#00ff88' : '#ffaa00';";
+  html += "    }";
+  html += "    const spo2El = document.getElementById('spo2');";
+  html += "    if (d.spo2 > 0) {";
+  html += "      spo2El.style.color = d.spo2 >= 90 ? '#00ff88' : '#ff4444';";
+  html += "    }";
+  html += "  });";
+  html += "}";
+  html += "setInterval(updateData, 1000);";
+  html += "window.onload = updateData;";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>💓 MAX30102 - FIR FILTER ALGORITHM</h1>";
+  html += "<div class='algorithm-badge'>🔬 Advanced FIR Digital Filter + Peak Detection</div>";
+  
+  html += "<div class='card status-card'>";
+  html += "<div id='status' class='status-indicator ok'></div>";
+  html += "<div id='status-text'>Đang kiểm tra...</div>";
+  html += "</div>";
+  
+  html += "<div class='card metric-card'>";
+  html += "<div class='metric-label'>❤️ NHỊP TIM (Heart Rate)</div>";
+  html += "<div class='metric-value' id='hr'>--<span class='metric-unit'>BPM</span></div>";
+  html += "</div>";
+  
+  html += "<div class='card metric-card'>";
+  html += "<div class='metric-label'>🫁 NỒNG ĐỘ OXY (SpO2)</div>";
+  html += "<div class='metric-value' id='spo2'>--<span class='metric-unit'>%</span></div>";
+  html += "</div>";
+  
+  html += "<div class='card metric-card'>";
+  html += "<div class='metric-label'>🌡️ NHIỆT ĐỘ</div>";
+  html += "<div class='metric-value' id='temp' style='font-size: 2.5em;'>--<span class='metric-unit'>°C</span></div>";
+  html += "</div>";
+  
+  html += "<div class='card'>";
+  html += "<div class='button-group'>";
+  html += "<button onclick='fetch(\"/history\").then(r=>r.text()).then(alert)'>📊 Lịch sử</button>";
+  html += "<button onclick='fetch(\"/stats\").then(r=>r.text()).then(alert)'>📈 Thống kê</button>";
+  html += "<button onclick='if(confirm(\"Xóa lịch sử?\")){fetch(\"/clear\").then(r=>r.text()).then(alert)}'>🗑️ Xóa</button>";
+  html += "</div></div>";
+  
+  html += "<div class='footer'>";
+  html += "⚠️ Chỉ để tham khảo, không thay thế thiết bị y tế<br>";
+  html += "Algorithm: FIR Bandpass Filter (0.5-5Hz) + Peak Detection";
+  html += "</div>";
+  
+  html += "</div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"hr\":" + String(heartRate, 1) + ",";
+  json += "\"spo2\":" + String(spo2, 1) + ",";
+  json += "\"temp\":" + String(temperature, 1) + ",";
+  json += "\"finger\":" + String(fingerDetected ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() {
+  String result = "LỊCH SỬ ĐO (" + String(historyCount) + " lần)\n\n";
+  if (historyCount == 0) {
+    result = "Chưa có dữ liệu!";
+  } else {
+    for (int i = 0; i < historyCount; i++) {
+      result += String(i + 1) + ". HR: " + String(hrHistory[i], 1) + " BPM | SpO2: " + String(spo2History[i], 1) + "%\n";
+    }
+  }
+  server.send(200, "text/plain; charset=utf-8", result);
+}
+
+void handleStats() {
+  if (historyCount == 0) {
+    server.send(200, "text/plain; charset=utf-8", "Chưa có dữ liệu!");
+    return;
+  }
+  
+  float hrMin = 999, hrMax = 0, hrSum = 0;
+  float spo2Min = 999, spo2Max = 0, spo2Sum = 0;
+  int hrCount = 0, spo2Count = 0;
+  
+  for (int i = 0; i < historyCount; i++) {
+    if (hrHistory[i] > 0) {
+      if (hrHistory[i] < hrMin) hrMin = hrHistory[i];
+      if (hrHistory[i] > hrMax) hrMax = hrHistory[i];
+      hrSum += hrHistory[i];
+      hrCount++;
+    }
+    if (spo2History[i] > 0) {
+      if (spo2History[i] < spo2Min) spo2Min = spo2History[i];
+      if (spo2History[i] > spo2Max) spo2Max = spo2History[i];
+      spo2Sum += spo2History[i];
+      spo2Count++;
+    }
+  }
+  
+  String result = "THỐNG KÊ\n\n";
+  result += "Heart Rate:\n";
+  result += "  TB: " + String(hrSum / hrCount, 1) + " BPM\n";
+  result += "  Min: " + String(hrMin, 1) + " BPM\n";
+  result += "  Max: " + String(hrMax, 1) + " BPM\n\n";
+  
+  result += "SpO2:\n";
+  result += "  TB: " + String(spo2Sum / spo2Count, 1) + " %\n";
+  result += "  Min: " + String(spo2Min, 1) + " %\n";
+  result += "  Max: " + String(spo2Max, 1) + " %\n";
+  
+  server.send(200, "text/plain; charset=utf-8", result);
+}
+
+void handleClear() {
+  historyCount = 0;
+  historyIndex = 0;
+  Serial.println("✅ Đã xóa lịch sử!");
+  server.send(200, "text/plain; charset=utf-8", "✅ Đã xóa lịch sử!");
+}
+
+// ========== LƯU LỊCH SỬ ==========
+void saveToHistory() {
+  if (fingerDetected && heartRate > 0 && spo2 > 0) {
+    hrHistory[historyIndex] = heartRate;
+    spo2History[historyIndex] = spo2;
+    
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+    if (historyCount < HISTORY_SIZE) {
+      historyCount++;
+    }
+  }
+}
+
+// ========== CẢNH BÁO ==========
+void checkAlerts() {
+  if (!alertEnabled || !fingerDetected) return;
+  
+  if (heartRate > 0) {
+    if (heartRate < hrMin) {
+      Serial.println("⚠️  CẢNH BÁO: Nhịp tim quá thấp! (" + String(heartRate, 1) + " BPM)");
+    } else if (heartRate > hrMax) {
+      Serial.println("⚠️  CẢNH BÁO: Nhịp tim quá cao! (" + String(heartRate, 1) + " BPM)");
+    }
+  }
+  
+  if (spo2 > 0 && spo2 < spo2Min) {
+    Serial.println("⚠️  CẢNH BÁO: SpO2 thấp! (" + String(spo2, 1) + "%)");
+  }
+}
+
+// ========== LED RGB ==========
+void updateStatusLED() {
+  if (!fingerDetected) {
+    setLED(255, 0, 0); // Đỏ = Không có ngón tay
+  } else if ((heartRate > 0 && (heartRate < hrMin || heartRate > hrMax)) || 
+             (spo2 > 0 && spo2 < spo2Min)) {
+    setLED(255, 165, 0); // Cam = Cảnh báo
+  } else {
+    setLED(0, 255, 0); // Xanh = OK
+  }
+}
+
+void setLED(int r, int g, int b) {
+  analogWrite(LED_R, 255 - r);
+  analogWrite(LED_G, 255 - g);
+  analogWrite(LED_B, 255 - b);
+}
+
+// ========== IN KẾT QUẢ ==========
+void printResults() {
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint < 1000) return; // In mỗi giây
+  lastPrint = millis();
+  
+  Serial.println("\n╔════════════════════════════════════════╗");
+  
+  Serial.print("║ Trạng thái: ");
+  if (fingerDetected) {
+    Serial.println("👆 Ngón tay OK           ║");
+  } else {
+    Serial.println("❌ Chưa đặt ngón tay      ║");
+  }
+  
+  Serial.print("║ Nhịp tim:   ");
+  if (heartRate > 0) {
+    Serial.print(heartRate, 1);
+    Serial.print(" BPM");
+    if (heartRate >= 50 && heartRate <= 120) {
+      Serial.println("   ✅     ║");
+    } else {
+      Serial.println("   ⚠️      ║");
+    }
+  } else {
+    Serial.println("--                    ║");
+  }
+  
+  Serial.print("║ SpO2:       ");
+  if (spo2 > 0) {
+    Serial.print(spo2, 1);
+    Serial.print(" %");
+    if (spo2 >= 90) {
+      Serial.println("       ✅     ║");
+    } else {
+      Serial.println("       ⚠️      ║");
+    }
+  } else {
+    Serial.println("--                    ║");
+  }
+  
+  Serial.print("║ Nhiệt độ:   ");
+  Serial.print(temperature, 1);
+  Serial.println(" °C               ║");
+  
+  Serial.print("║ Lịch sử:    ");
+  Serial.print(historyCount);
+  Serial.println(" lần đo            ║");
+  
+  // Debug FIR values
+  Serial.print("║ FIR IR:     ");
+  Serial.print(firyv[4], 2);
+  Serial.println("              ║");
+  
+  Serial.print("║ FIR Red:    ");
+  Serial.print(fredyv[4], 2);
+  Serial.println("              ║");
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("╟────────────────────────────────────────╢");
+    Serial.print("║ 🌐 Web: http://");
+    String ip = WiFi.localIP().toString();
+    Serial.print(ip);
+    int spaces = 20 - ip.length();
+    for (int i = 0; i < spaces; i++) Serial.print(" ");
+    Serial.println("║");
+  }
+  
+  Serial.println("╚════════════════════════════════════════╝");
+}
