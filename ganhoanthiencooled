@@ -543,23 +543,25 @@ void handleRoot() {
   html += "}";
   
   // Load history
-  html += "function showHistory() {";
-  html += "  document.getElementById('data-header').innerHTML = '📊 LỊCH SỬ';";
-  html += "  fetch('/history').then(r => r.text()).then(text => {";
-  html += "    const lines = text.split('\\n').filter(l => l.trim());";
-  html += "    if (lines.length <= 2 || text.includes('Chưa có')) {";
-  html += "      document.getElementById('data-content').innerHTML = '<div class=\"no-data\">Chưa có dữ liệu</div>';";
-  html += "      return;";
-  html += "    }";
-  html += "    let html = '';";
-  html += "    for (let i = 2; i < lines.length; i++) {";
-  html += "      html += '<div class=\"history-item\">' + lines[i] + '</div>';";
-  html += "    }";
-  html += "    document.getElementById('data-content').innerHTML = html;";
-  html += "  });";
-  html += "}";
-  
+ html += "function showHistory() {";
+html += "  currentView = 'history';";  // Đánh dấu view
+html += "  document.getElementById('data-header').innerHTML = '📊 LỊCH SỬ';";
+html += "  fetch('/history').then(r => r.text()).then(text => {";
+html += "    const lines = text.split('\\n').filter(l => l.trim());";
+html += "    if (lines.length <= 2 || text.includes('Chưa có')) {";
+html += "      document.getElementById('data-content').innerHTML = '<div class=\"no-data\">Chưa có dữ liệu</div>';";
+html += "      return;";
+html += "    }";
+html += "    let html = '';";
+html += "    for (let i = 2; i < lines.length; i++) {";
+html += "      html += '<div class=\"history-item\">' + lines[i] + '</div>';";
+html += "    }";
+html += "    document.getElementById('data-content').innerHTML = html;";
+html += "  });";
+html += "}";
+
 html += "function showStats() {";
+html += "  currentView = 'stats';";  // Đánh dấu view
 html += "  document.getElementById('data-header').innerHTML = '📈 THỐNG KÊ';";
 html += "  fetch('/stats').then(r => r.text()).then(text => {";
 html += "    if (text.includes('Chưa có')) {";
@@ -568,7 +570,7 @@ html += "      return;";
 html += "    }";
 html += "    const lines = text.split('\\n').filter(l => l.trim());";
 html += "    let html = '';";
-html += "    for (let i = 0; i < lines.length; i++) {";  // ← ĐỔI TỪ 2 THÀNH 0
+html += "    for (let i = 0; i < lines.length; i++) {";  // ← FIX: Đổi từ 2 thành 0
 html += "      html += '<div style=\"margin:8px 0\">' + lines[i] + '</div>';";
 html += "    }";
 html += "    document.getElementById('data-content').innerHTML = html;";
@@ -585,12 +587,12 @@ html += "}";
   html += "  }";
   html += "}";
   
-  html += "setInterval(updateData, 1000);";
-  html += "setInterval(() => {";
-  html += "  const header = document.getElementById('data-header').innerHTML;";
-  html += "  if (header.includes('LỊCH SỬ')) showHistory();";
-  html += "  else if (header.includes('THỐNG KÊ')) showStats();";
-  html += "}, 2000);";
+ html += "let currentView = 'history';";  // Thêm biến theo dõi view hiện tại
+html += "setInterval(updateData, 1000);";
+html += "setInterval(() => {";
+html += "  if (currentView === 'history') showHistory();";
+html += "  else if (currentView === 'stats') showStats();";
+html += "}, 1000);";  // Giảm từ 2000ms xuống 1000ms để đồng bộ với updateData
   html += "updateData();";
   html += "showHistory();";
   html += "</script>";
