@@ -4,7 +4,12 @@
  * Pure I2C - OLED SSD1306 0.96"
  * ============================================
  */
-
+#define BLYNK_TEMPLATE_ID "TMPL6HpdLtPR8"
+#define BLYNK_TEMPLATE_NAME "nhiptim"
+#define BLYNK_AUTH_TOKEN "It1phhqw11q4_r0XJfj70CAY9IaGP4Cv"
+#define BLYNK_PRINT Serial
+#include <BlynkSimpleEsp32.h>
+char auth[] = BLYNK_AUTH_TOKEN;
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -416,6 +421,9 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("IP: http://");
     Serial.println(WiFi.localIP());
+      
+    Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+    Serial.println("Blynk Connected");
     
     display.clearDisplay();
     display.setCursor(0, 10);
@@ -675,5 +683,18 @@ void saveToHistory() {
     spo2History[historyIndex] = spo2;
     historyIndex = (historyIndex + 1) % HISTORY_SIZE;
     if (historyCount < HISTORY_SIZE) historyCount++;
+  }
+}
+void sendToBlynk() {
+  if (!Blynk.connected()) return;
+
+  if (fingerDetected) {
+    Blynk.virtualWrite(V0, (int)heartRate);   // HR
+    Blynk.virtualWrite(V1, (int)spo2);        // SpO2
+    Blynk.virtualWrite(V2, temperature);      // Temp
+  } else {
+    Blynk.virtualWrite(V0, 0);
+    Blynk.virtualWrite(V1, 0);
+    Blynk.virtualWrite(V2, 0);
   }
 }
