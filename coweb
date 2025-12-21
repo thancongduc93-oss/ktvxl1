@@ -1,0 +1,653 @@
+/*
+ * ============================================
+ * THIẾT BỊ ĐO NHỊP TIM VÀ SPO2 - MAX30102
+ * ESP32-C3 + MAX30102 + Web Dashboard
+ * ============================================
+ * Tính năng:
+ * - Đo nhịp tim (Heart Rate)
+ * - Đo nồng độ oxy trong máu (SpO2)
+ * - Đo nhiệt độ cơ thể
+ * - Web dashboard real-time
+ * - Lưu lịch sử 60 lần đo
+ * - Thống kê min/max/trung bình
+ * - Cảnh báo bất thường
+ * - LED RGB hiển thị trạng thái
+ * ============================================
+ */
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ========== CẤU HÌNH WIFI ==========
+const char* ssid = "MU VO DICH";
+const char* password = "12344321";
+
+// ========== KHỞI TẠO CÁC THÀNH PHẦN ==========
+MAX30105 sensor;
+WebServer server(80);
+
+// ========== BIẾN ĐO ==========
+float heartRate = 0;
+float spo2 = 0;
+float temperature = 0;
+bool fingerDetected = false;
+
+// ========== LƯU LỊCH SỬ (60 LẦN ĐO) ==========
+#define HISTORY_SIZE 60
+float hrHistory[HISTORY_SIZE];
+float spo2History[HISTORY_SIZE];
+int historyIndex = 0;
+int historyCount = 0;
+
+// ========== CÀI ĐẶT CẢNH BÁO ==========
+bool alertEnabled = true;
+int hrMin = 50;    // Nhịp tim tối thiểu
+int hrMax = 120;   // Nhịp tim tối đa
+int spo2Min = 90;  // SpO2 tối thiểu
+
+// ========== LED RGB PINS ==========
+#define LED_R 10
+#define LED_G 3
+#define LED_B 4
+
+// ========== BUFFER ĐỌC DỮ LIỆU ==========
+#define BUFFER_SIZE 100
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+
+// ========== SETUP - KHỞI TẠO ==========
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║   THIẾT BỊ ĐO NHỊP TIM MAX30102       ║");
+  Serial.println("║   ESP32-C3 + Web Dashboard             ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+  
+  // Setup LED RGB
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  setLED(0, 0, 255); // Xanh dương = đang khởi động
+  
+  Serial.println("🔧 Khởi động I2C...");
+  Wire.begin(8, 9); // SDA=GPIO8, SCL=GPIO9
+  Wire.setClock(400000); // 400kHz
+  
+  Serial.println("🔧 Tìm kiếm MAX30102...");
+  if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("❌ KHÔNG TÌM THẤY MAX30102!");
+    Serial.println("Kiểm tra kết nối:");
+    Serial.println("  VIN → 3.3V");
+    Serial.println("  GND → GND");
+    Serial.println("  SDA → GPIO 8");
+    Serial.println("  SCL → GPIO 9");
+    setLED(255, 0, 0); // Đỏ = lỗi
+    while (1) {
+      delay(1000);
+    }
+  }
+  
+  Serial.println("✅ MAX30102 đã sẵn sàng!");
+  
+  // Cấu hình cảm biến tối ưu
+  Serial.println("🔧 Cấu hình cảm biến...");
+  
+  // Tăng độ sáng LED để dễ phát hiện hơn
+  byte ledBrightness = 0x7F; // Tăng từ 0x3F lên 0x7F (127)
+  byte sampleAverage = 4;
+  byte ledMode = 2; // Red + IR
+  int sampleRate = 400;
+  int pulseWidth = 411;
+  int adcRange = 4096;
+  
+  sensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+  
+  // Tăng cường độ LED Red và IR
+  sensor.setPulseAmplitudeRed(0x1F); // Tăng từ 0x0A lên 0x1F
+  sensor.setPulseAmplitudeIR(0x1F);  // Tăng từ 0x0A lên 0x1F
+  sensor.enableDIETEMPRDY();
+  
+  Serial.println("✅ Cấu hình: LED Brightness = 127, Pulse Amplitude = 31");
+  
+  // Kết nối WiFi
+  Serial.println("\n📡 Đang kết nối WiFi...");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ WiFi đã kết nối!");
+    Serial.print("📱 Địa chỉ IP: http://");
+    Serial.println(WiFi.localIP());
+    Serial.println("👉 Mở trình duyệt và truy cập địa chỉ IP trên");
+    
+    setupWebServer();
+    server.begin();
+    setLED(0, 255, 0); // Xanh lá = sẵn sàng
+  } else {
+    Serial.println("⚠️  Không kết nối được WiFi");
+    Serial.println("Thiết bị vẫn hoạt động, chỉ không có web dashboard");
+    setLED(255, 255, 0); // Vàng = không có WiFi
+  }
+  
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║  🩺 ĐẶT NGÓN TAY LÊN CẢM BIẾN         ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+  
+  // Test đọc giá trị IR
+  Serial.println("🔍 Đang test cảm biến...");
+  delay(1000);
+  for (int i = 0; i < 5; i++) {
+    sensor.check();
+    uint32_t ir = sensor.getIR();
+    uint32_t red = sensor.getRed();
+    Serial.print("Test ");
+    Serial.print(i+1);
+    Serial.print(": IR=");
+    Serial.print(ir);
+    Serial.print(", RED=");
+    Serial.println(red);
+    delay(500);
+  }
+  Serial.println("✅ Test hoàn tất! Bắt đầu đo...\n");
+  
+  delay(1000);
+}
+
+// ========== LOOP - VÒNG LẶP CHÍNH ==========
+void loop() {
+  // Xử lý các yêu cầu web
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
+  
+  // Đo các chỉ số sức khỏe
+  measureVitals();
+  
+  // Đọc nhiệt độ từ cảm biến
+  temperature = sensor.readTemperature();
+  
+  // Lưu vào lịch sử
+  saveToHistory();
+  
+  // Kiểm tra và cảnh báo
+  checkAlerts();
+  
+  // Cập nhật LED trạng thái
+  updateStatusLED();
+  
+  // In kết quả ra Serial Monitor
+  printResults();
+  
+  delay(1000); // Đo mỗi giây
+}
+
+// ========== TÍNH NĂNG 1: WEB SERVER ==========
+void setupWebServer() {
+  // Trang chủ - Dashboard
+  server.on("/", HTTP_GET, handleRoot);
+  
+  // API endpoint - Lấy dữ liệu real-time
+  server.on("/data", HTTP_GET, handleData);
+  
+  // Xem lịch sử
+  server.on("/history", HTTP_GET, handleHistory);
+  
+  // Xem thống kê
+  server.on("/stats", HTTP_GET, handleStats);
+  
+  // Xóa lịch sử
+  server.on("/clear", HTTP_GET, handleClear);
+  
+  Serial.println("✅ Web server đã khởi động");
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>Thiết bị đo nhịp tim</title>";
+  html += "<style>";
+  html += "* { margin: 0; padding: 0; box-sizing: border-box; }";
+  html += "body { font-family: 'Segoe UI', Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 20px; min-height: 100vh; }";
+  html += ".container { max-width: 800px; margin: 0 auto; }";
+  html += "h1 { text-align: center; margin-bottom: 30px; font-size: 2em; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }";
+  html += ".card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 25px; margin: 15px 0; box-shadow: 0 8px 32px rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); }";
+  html += ".status-card { display: flex; align-items: center; font-size: 1.2em; }";
+  html += ".status-indicator { width: 20px; height: 20px; border-radius: 50%; margin-right: 15px; animation: pulse 2s infinite; }";
+  html += "@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }";
+  html += ".ok { background: #00ff00; box-shadow: 0 0 20px #00ff00; }";
+  html += ".warning { background: #ffaa00; box-shadow: 0 0 20px #ffaa00; }";
+  html += ".error { background: #ff0000; box-shadow: 0 0 20px #ff0000; }";
+  html += ".metric-card { text-align: center; }";
+  html += ".metric-label { font-size: 1.2em; margin-bottom: 10px; opacity: 0.9; }";
+  html += ".metric-value { font-size: 4em; font-weight: bold; margin: 15px 0; text-shadow: 2px 2px 8px rgba(0,0,0,0.3); transition: color 0.3s; }";
+  html += ".metric-unit { font-size: 0.4em; opacity: 0.8; }";
+  html += ".button-group { display: flex; gap: 10px; flex-wrap: wrap; }";
+  html += "button { flex: 1; min-width: 150px; background: rgba(255,255,255,0.2); color: white; border: 2px solid rgba(255,255,255,0.3); padding: 15px 20px; border-radius: 12px; cursor: pointer; font-size: 1em; font-weight: bold; transition: all 0.3s; }";
+  html += "button:hover { background: rgba(255,255,255,0.3); transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.3); }";
+  html += "button:active { transform: translateY(0); }";
+  html += ".footer { text-align: center; margin-top: 30px; font-size: 0.9em; opacity: 0.7; }";
+  html += "@media (max-width: 600px) { .metric-value { font-size: 3em; } h1 { font-size: 1.5em; } }";
+  html += "</style>";
+  html += "<script>";
+  html += "function updateData() {";
+  html += "  fetch('/data').then(r => r.json()).then(d => {";
+  html += "    document.getElementById('hr').innerHTML = d.hr > 0 ? d.hr : '--';";
+  html += "    document.getElementById('spo2').innerHTML = d.spo2 > 0 ? d.spo2 : '--';";
+  html += "    document.getElementById('temp').innerHTML = d.temp;";
+  html += "    const statusEl = document.getElementById('status');";
+  html += "    const statusText = document.getElementById('status-text');";
+  html += "    if (d.finger) {";
+  html += "      statusEl.className = 'status-indicator ok';";
+  html += "      statusText.innerHTML = '✅ Ngón tay đã đặt đúng';";
+  html += "    } else {";
+  html += "      statusEl.className = 'status-indicator error';";
+  html += "      statusText.innerHTML = '❌ Vui lòng đặt ngón tay';";
+  html += "    }";
+  html += "    const hrEl = document.getElementById('hr');";
+  html += "    if (d.hr > 0) {";
+  html += "      hrEl.style.color = (d.hr >= 50 && d.hr <= 120) ? '#00ff88' : '#ffaa00';";
+  html += "    } else {";
+  html += "      hrEl.style.color = '#666';";
+  html += "    }";
+  html += "    const spo2El = document.getElementById('spo2');";
+  html += "    if (d.spo2 > 0) {";
+  html += "      spo2El.style.color = d.spo2 >= 90 ? '#00ff88' : '#ff4444';";
+  html += "    } else {";
+  html += "      spo2El.style.color = '#666';";
+  html += "    }";
+  html += "  }).catch(e => console.error('Error:', e));";
+  html += "}";
+  html += "setInterval(updateData, 1000);";
+  html += "window.onload = updateData;";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>💓 THIẾT BỊ ĐO NHỊP TIM MAX30102</h1>";
+  
+  // Status card
+  html += "<div class='card status-card'>";
+  html += "<div id='status' class='status-indicator ok'></div>";
+  html += "<div id='status-text'>Đang kiểm tra...</div>";
+  html += "</div>";
+  
+  // Heart Rate
+  html += "<div class='card metric-card'>";
+  html += "<div class='metric-label'>❤️ NHỊP TIM (Heart Rate)</div>";
+  html += "<div class='metric-value' id='hr'>--<span class='metric-unit'>BPM</span></div>";
+  html += "</div>";
+  
+  // SpO2
+  html += "<div class='card metric-card'>";
+  html += "<div class='metric-label'>🫁 NỒNG ĐỘ OXY (SpO2)</div>";
+  html += "<div class='metric-value' id='spo2'>--<span class='metric-unit'>%</span></div>";
+  html += "</div>";
+  
+  // Temperature
+  html += "<div class='card metric-card'>";
+  html += "<div class='metric-label'>🌡️ NHIỆT ĐỘ (Temperature)</div>";
+  html += "<div class='metric-value' id='temp' style='font-size: 2.5em;'>--<span class='metric-unit'>°C</span></div>";
+  html += "</div>";
+  
+  // Buttons
+  html += "<div class='card'>";
+  html += "<div class='button-group'>";
+  html += "<button onclick='fetch(\"/history\").then(r=>r.text()).then(alert)'>📊 Xem lịch sử</button>";
+  html += "<button onclick='fetch(\"/stats\").then(r=>r.text()).then(alert)'>📈 Thống kê</button>";
+  html += "<button onclick='if(confirm(\"Xóa toàn bộ lịch sử?\")){fetch(\"/clear\").then(r=>r.text()).then(alert)}'>🗑️ Xóa lịch sử</button>";
+  html += "</div></div>";
+  
+  // Footer
+  html += "<div class='footer'>";
+  html += "⚠️ Thiết bị này chỉ để tham khảo, không thay thế thiết bị y tế chuyên nghiệp<br>";
+  html += "Developed with ❤️ for health monitoring | ESP32-C3 + MAX30102";
+  html += "</div>";
+  
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"hr\":" + String(heartRate, 1) + ",";
+  json += "\"spo2\":" + String(spo2, 1) + ",";
+  json += "\"temp\":" + String(temperature, 1) + ",";
+  json += "\"finger\":" + String(fingerDetected ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() {
+  String result = "╔════════════════════════════════════════╗\n";
+  result += "║       LỊCH SỬ ĐO (" + String(historyCount) + " LẦN ĐO)          ║\n";
+  result += "╚════════════════════════════════════════╝\n\n";
+  
+  if (historyCount == 0) {
+    result = "Chưa có dữ liệu.\nHãy đặt ngón tay lên cảm biến để bắt đầu đo!";
+  } else {
+    for (int i = 0; i < historyCount; i++) {
+      result += String(i+1) + ". ";
+      result += "Nhịp tim: " + String(hrHistory[i], 1) + " BPM";
+      result += " | SpO2: " + String(spo2History[i], 1) + "%\n";
+    }
+  }
+  
+  server.send(200, "text/plain; charset=utf-8", result);
+}
+
+void handleStats() {
+  if (historyCount == 0) {
+    server.send(200, "text/plain; charset=utf-8", "Chưa có dữ liệu để thống kê!\nHãy đo ít nhất một lần.");
+    return;
+  }
+  
+  float hrMin = 999, hrMax = 0, hrSum = 0;
+  float spo2Min = 999, spo2Max = 0, spo2Sum = 0;
+  int hrCount = 0, spo2Count = 0;
+  
+  for (int i = 0; i < historyCount; i++) {
+    if (hrHistory[i] > 0) {
+      if (hrHistory[i] < hrMin) hrMin = hrHistory[i];
+      if (hrHistory[i] > hrMax) hrMax = hrHistory[i];
+      hrSum += hrHistory[i];
+      hrCount++;
+    }
+    if (spo2History[i] > 0) {
+      if (spo2History[i] < spo2Min) spo2Min = spo2History[i];
+      if (spo2History[i] > spo2Max) spo2Max = spo2History[i];
+      spo2Sum += spo2History[i];
+      spo2Count++;
+    }
+  }
+  
+  String result = "╔════════════════════════════════════════╗\n";
+  result += "║            THỐNG KÊ CHI TIẾT           ║\n";
+  result += "╚════════════════════════════════════════╝\n\n";
+  
+  result += "📊 NHỊP TIM (Heart Rate):\n";
+  result += "  • Trung bình: " + String(hrSum/hrCount, 1) + " BPM\n";
+  result += "  • Thấp nhất:  " + String(hrMin, 1) + " BPM\n";
+  result += "  • Cao nhất:   " + String(hrMax, 1) + " BPM\n";
+  result += "  • Số mẫu:     " + String(hrCount) + "\n\n";
+  
+  result += "📊 NỒNG ĐỘ OXY (SpO2):\n";
+  result += "  • Trung bình: " + String(spo2Sum/spo2Count, 1) + " %\n";
+  result += "  • Thấp nhất:  " + String(spo2Min, 1) + " %\n";
+  result += "  • Cao nhất:   " + String(spo2Max, 1) + " %\n";
+  result += "  • Số mẫu:     " + String(spo2Count) + "\n\n";
+  
+  result += "═══════════════════════════════════════\n";
+  result += "Tổng số lần đo: " + String(historyCount) + "\n";
+  
+  // Đánh giá sức khỏe
+  result += "\n💡 ĐÁNH GIÁ:\n";
+  float avgHR = hrSum/hrCount;
+  float avgSpO2 = spo2Sum/spo2Count;
+  
+  if (avgHR >= 60 && avgHR <= 100) {
+    result += "  ✅ Nhịp tim bình thường\n";
+  } else if (avgHR < 60) {
+    result += "  ⚠️  Nhịp tim chậm (Bradycardia)\n";
+  } else {
+    result += "  ⚠️  Nhịp tim nhanh (Tachycardia)\n";
+  }
+  
+  if (avgSpO2 >= 95) {
+    result += "  ✅ Nồng độ oxy tốt\n";
+  } else if (avgSpO2 >= 90) {
+    result += "  ⚠️  Nồng độ oxy hơi thấp\n";
+  } else {
+    result += "  🚨 Nồng độ oxy thấp - cần khám bác sĩ\n";
+  }
+  
+  server.send(200, "text/plain; charset=utf-8", result);
+}
+
+void handleClear() {
+  historyCount = 0;
+  historyIndex = 0;
+  Serial.println("✅ Đã xóa toàn bộ lịch sử!");
+  server.send(200, "text/plain; charset=utf-8", "✅ Đã xóa lịch sử thành công!");
+}
+
+// ========== TÍNH NĂNG 2: LƯU LỊCH SỬ ==========
+void saveToHistory() {
+  if (fingerDetected && heartRate > 0 && spo2 > 0) {
+    hrHistory[historyIndex] = heartRate;
+    spo2History[historyIndex] = spo2;
+    
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+    if (historyCount < HISTORY_SIZE) {
+      historyCount++;
+    }
+  }
+}
+
+// ========== TÍNH NĂNG 3: CẢNH BÁO ==========
+void checkAlerts() {
+  if (!alertEnabled || !fingerDetected) return;
+  
+  if (heartRate > 0) {
+    if (heartRate < hrMin) {
+      Serial.println("⚠️  CẢNH BÁO: Nhịp tim quá thấp! (" + String(heartRate, 1) + " BPM)");
+      Serial.println("    Ngưỡng tối thiểu: " + String(hrMin) + " BPM");
+    } else if (heartRate > hrMax) {
+      Serial.println("⚠️  CẢNH BÁO: Nhịp tim quá cao! (" + String(heartRate, 1) + " BPM)");
+      Serial.println("    Ngưỡng tối đa: " + String(hrMax) + " BPM");
+    }
+  }
+  
+  if (spo2 > 0 && spo2 < spo2Min) {
+    Serial.println("⚠️  CẢNH BÁO: Nồng độ oxy thấp! (" + String(spo2, 1) + "%)");
+    Serial.println("    Ngưỡng tối thiểu: " + String(spo2Min) + "%");
+  }
+}
+
+// ========== TÍNH NĂNG 4: LED RGB STATUS ==========
+void updateStatusLED() {
+  if (!fingerDetected) {
+    setLED(255, 0, 0); // 🔴 Đỏ = Không có ngón tay
+  } else if ((heartRate > 0 && (heartRate < hrMin || heartRate > hrMax)) || 
+             (spo2 > 0 && spo2 < spo2Min)) {
+    setLED(255, 165, 0); // 🟠 Cam = Cảnh báo
+  } else {
+    setLED(0, 255, 0); // 🟢 Xanh = OK
+  }
+}
+
+void setLED(int r, int g, int b) {
+  // Common Anode RGB LED (đảo ngược giá trị)
+  analogWrite(LED_R, 255 - r);
+  analogWrite(LED_G, 255 - g);
+  analogWrite(LED_B, 255 - b);
+}
+
+// ========== ĐO CÁC CHỈ SỐ SỐNG ==========
+void measureVitals() {
+  // Thu thập dữ liệu buffer
+  for (int i = 0; i < BUFFER_SIZE; i++) {
+    while (sensor.available() == false) {
+      sensor.check();
+    }
+    redBuffer[i] = sensor.getRed();
+    irBuffer[i] = sensor.getIR();
+    sensor.nextSample();
+  }
+
+  // Kiểm tra ngón tay (hạ ngưỡng xuống 30000 để dễ phát hiện hơn)
+  uint32_t irMean = calculateMean(irBuffer, BUFFER_SIZE);
+  fingerDetected = (irMean > 30000); // Hạ từ 50000 xuống 30000
+  
+  // Debug: In giá trị IR để kiểm tra
+  static int debugCount = 0;
+  if (debugCount % 5 == 0) { // In mỗi 5 lần đo
+    Serial.print("🔍 DEBUG - IR Mean: ");
+    Serial.print(irMean);
+    Serial.print(" | Ngưỡng: 30000 | Phát hiện: ");
+    Serial.println(fingerDetected ? "CÓ" : "KHÔNG");
+  }
+  debugCount++;
+
+  if (fingerDetected) {
+    heartRate = calculateHeartRate(irBuffer, BUFFER_SIZE);
+    spo2 = calculateSpO2(redBuffer, irBuffer, BUFFER_SIZE);
+    
+    // Lọc giá trị không hợp lệ
+    if (heartRate < 40 || heartRate > 200) heartRate = 0;
+    if (spo2 < 70 || spo2 > 100) spo2 = 0;
+  } else {
+    heartRate = 0;
+    spo2 = 0;
+  }
+}
+
+// Tính giá trị trung bình
+uint32_t calculateMean(uint32_t *buffer, int size) {
+  uint64_t sum = 0;
+  for (int i = 0; i < size; i++) {
+    sum += buffer[i];
+  }
+  return sum / size;
+}
+
+// Tính Heart Rate bằng peak detection
+float calculateHeartRate(uint32_t *irBuffer, int size) {
+  float mean = calculateMean(irBuffer, size);
+  float threshold = mean * 0.005; // 0.5% của mean
+  
+  float peakPositions[20];
+  int peakCount = 0;
+  
+  // Phát hiện đỉnh
+  for (int i = 2; i < size - 2; i++) {
+    if (irBuffer[i] > irBuffer[i-1] && 
+        irBuffer[i] > irBuffer[i+1] &&
+        irBuffer[i] > irBuffer[i-2] &&
+        irBuffer[i] > irBuffer[i+2]) {
+      
+      float peak = irBuffer[i] - mean;
+      if (peak > threshold && peakCount < 20) {
+        peakPositions[peakCount++] = i;
+      }
+    }
+  }
+
+  if (peakCount < 2) return 0;
+
+  // Tính khoảng cách trung bình giữa các đỉnh
+  float avgDistance = 0;
+  for (int i = 1; i < peakCount; i++) {
+    avgDistance += peakPositions[i] - peakPositions[i-1];
+  }
+  avgDistance /= (peakCount - 1);
+
+  // Chuyển sang BPM (400 samples/sec)
+  float bpm = (400.0 * 60.0) / avgDistance;
+  
+  return bpm;
+}
+
+// Tính SpO2 bằng R-value method
+float calculateSpO2(uint32_t *redBuffer, uint32_t *irBuffer, int size) {
+  float redAC = 0, redDC = 0;
+  float irAC = 0, irDC = 0;
+  
+  // Tính DC (giá trị trung bình)
+  for (int i = 0; i < size; i++) {
+    redDC += redBuffer[i];
+    irDC += irBuffer[i];
+  }
+  redDC /= size;
+  irDC /= size;
+  
+  // Tính AC (RMS của biến động)
+  for (int i = 0; i < size; i++) {
+    float redDiff = redBuffer[i] - redDC;
+    float irDiff = irBuffer[i] - irDC;
+    redAC += redDiff * redDiff;
+    irAC += irDiff * irDiff;
+  }
+  redAC = sqrt(redAC / size);
+  irAC = sqrt(irAC / size);
+  
+  // Tính R-value
+  float R = (redAC / redDC) / (irAC / irDC);
+  
+  // Công thức hiệu chuẩn SpO2 (từ Maxim Integrated)
+  float spo2Value = -45.060 * R * R + 30.354 * R + 94.845;
+  
+  return spo2Value;
+}
+
+// In kết quả ra Serial Monitor
+void printResults() {
+  Serial.println("\n╔════════════════════════════════════════╗");
+  
+  Serial.print("║ Trạng thái: ");
+  if (fingerDetected) {
+    Serial.println("👆 Ngón tay OK           ║");
+  } else {
+    Serial.println("❌ Chưa đặt ngón tay      ║");
+  }
+  
+  Serial.print("║ Nhịp tim:   ");
+  if (heartRate > 0) {
+    Serial.print(heartRate, 1);
+    Serial.print(" BPM");
+    if (heartRate >= 50 && heartRate <= 120) {
+      Serial.println("   ✅     ║");
+    } else {
+      Serial.println("   ⚠️      ║");
+    }
+  } else {
+    Serial.println("--                    ║");
+  }
+  
+  Serial.print("║ SpO2:       ");
+  if (spo2 > 0) {
+    Serial.print(spo2, 1);
+    Serial.print(" %");
+    if (spo2 >= 90) {
+      Serial.println("       ✅     ║");
+    } else {
+      Serial.println("       ⚠️      ║");
+    }
+  } else {
+    Serial.println("--                    ║");
+  }
+  
+  Serial.print("║ Nhiệt độ:   ");
+  Serial.print(temperature, 1);
+  Serial.println(" °C               ║");
+  
+  Serial.print("║ Lịch sử:    ");
+  Serial.print(historyCount);
+  Serial.println(" lần đo            ║");
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("╟────────────────────────────────────────╢");
+    Serial.print("║ 🌐 Web: http://");
+    String ip = WiFi.localIP().toString();
+    Serial.print(ip);
+    int spaces = 20 - ip.length();
+    for(int i = 0; i < spaces; i++) Serial.print(" ");
+    Serial.println("║");
+  }
+  
+  Serial.println("╚════════════════════════════════════════╝");
+}
