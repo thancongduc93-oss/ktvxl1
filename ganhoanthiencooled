@@ -65,11 +65,6 @@ int hrMin = 50;
 int hrMax = 120;
 int spo2Min = 90;
 
-// ========== LED ==========
-#define LED_R 10
-#define LED_G 3
-#define LED_B 4
-
 // ========== POWER ==========
 int irpower = 0x7F;  // Giảm từ 0xD0 xuống 0x7F
 int rpower = 0x7F;   // Giảm từ 0xA0 xuống 0x7F
@@ -222,13 +217,6 @@ void updateDisplay() {
   display.display();
 }
 
-// ========== OLED ICONS (tùy chọn) ==========
-void drawHeart(int x, int y) {
-  display.fillCircle(x, y, 3, SSD1306_WHITE);
-  display.fillCircle(x + 6, y, 3, SSD1306_WHITE);
-  display.fillTriangle(x - 3, y + 1, x + 9, y + 1, x + 3, y + 8, SSD1306_WHITE);
-}
-
 // ========== SMOOTHING ==========
 float smoothBPM(float newBPM) {
   if (newBPM <= 0) return (heartRate > 0) ? heartRate : 0;
@@ -299,8 +287,8 @@ void measureVitals() {
                 (-1.1718123813 * fredyv[2]) +
                 (1.9738037992 * fredyv[3]);
     
-    // Peak Detection - QUAN TRỌNG: Giảm ngưỡng xuống
-    if (-1.0 * firyv[4] >= 50 &&  // Giảm từ 100 xuống 50
+    // Peak Detection
+    if (-1.0 * firyv[4] >= 50 &&
         -1.0 * firyv[2] > -1.0 * firyv[0] &&
         -1.0 * firyv[2] > -1.0 * firyv[4]) {
       
@@ -374,13 +362,6 @@ void measureVitals() {
 void setup() {
   Serial.begin(115200);
   
-  pinMode(LED_R, OUTPUT);
-  pinMode(LED_G, OUTPUT);
-  pinMode(LED_B, OUTPUT);
-  analogWrite(LED_R, 0);
-  analogWrite(LED_G, 0);
-  analogWrite(LED_B, 255);
-  
   // Khởi động OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("OLED Error!");
@@ -429,9 +410,6 @@ void setup() {
     
     setupWebServer();
     server.begin();
-    analogWrite(LED_R, 0);
-    analogWrite(LED_G, 255);
-    analogWrite(LED_B, 0);
   } else {
     Serial.println("No WiFi");
     display.clearDisplay();
@@ -455,7 +433,6 @@ void loop() {
   }
   
   saveToHistory();
-  updateStatusLED();
   
   // Cập nhật OLED mỗi 500ms
   static unsigned long lastOledUpdate = 0;
@@ -464,7 +441,7 @@ void loop() {
     lastOledUpdate = millis();
   }
   
-  delay(10);  // QUAN TRỌNG: 10ms để đạt 100Hz sampling
+  delay(10);
 }
 
 // ========== WEB SERVER ==========
@@ -586,15 +563,5 @@ void saveToHistory() {
     spo2History[historyIndex] = spo2;
     historyIndex = (historyIndex + 1) % HISTORY_SIZE;
     if (historyCount < HISTORY_SIZE) historyCount++;
-  }
-}
-
-void updateStatusLED() {
-  if (!fingerDetected) {
-    analogWrite(LED_R, 255); analogWrite(LED_G, 0); analogWrite(LED_B, 0);
-  } else if ((heartRate > 0 && (heartRate < hrMin || heartRate > hrMax)) || (spo2 > 0 && spo2 < spo2Min)) {
-    analogWrite(LED_R, 255); analogWrite(LED_G, 165); analogWrite(LED_B, 0);
-  } else {
-    analogWrite(LED_R, 0); analogWrite(LED_G, 255); analogWrite(LED_B, 0);
   }
 }
