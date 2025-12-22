@@ -1,9 +1,4 @@
-/*
- * ============================================
- * MAX30102 - FIR FILTER + OLED + WEB
- * Pure I2C - OLED SSD1306 0.96"
- * ============================================
- */
+
 #define BLYNK_TEMPLATE_ID "TMPL6HpdLtPR8"
 #define BLYNK_TEMPLATE_NAME "nhiptim"
 #define BLYNK_AUTH_TOKEN "It1phhqw11q4_r0XJfj70CAY9IaGP4Cv"
@@ -159,7 +154,6 @@ float readTemperature() {
 }
 
 // ========== OLED DISPLAY ==========
-// ========== OLED DISPLAY ==========
 void updateDisplay() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -212,12 +206,12 @@ void updateDisplay() {
   display.setTextSize(1);
   display.setCursor(5, 57);
   if (fingerDetected) {
-    display.print("OK");
+    display.print("Finger");
   } else {
     display.print("No Finger");
   }
   
-  // Nhiệt độ - CHỈ HIỂN THỊ KHI CÓ NGÓN TAY
+  // Nhiệt độ
   display.setCursor(75, 57);
   if (fingerDetected) {
     display.print(temperature, 1);
@@ -318,10 +312,10 @@ void measureVitals() {
         -1.0 * firyv[2] > -1.0 * firyv[0] &&
         -1.0 * firyv[2] > -1.0 * firyv[4]) {
       
-      // Minimum 0.5s between peaks (120 BPM max)
+      // Minimum 0.5s between peaks 
       if (meastime - lastmeastime < 0.5) continue;
       
-      // Maximum 2s between peaks (30 BPM min)
+      // Maximum 2s between peaks 
       if (meastime - lastmeastime > 2.0) {
         lastmeastime = meastime;
         continue;
@@ -329,7 +323,6 @@ void measureVitals() {
       
       float bpm = 60.0 / (meastime - lastmeastime);
       
-      // VALIDATION: Chỉ chấp nhận 40-140 BPM
       if (bpm < 40 || bpm > 140) {
         lastmeastime = meastime;
         continue;
@@ -460,18 +453,13 @@ if (millis() - lastBlynk > 1000) {
   sendToBlynk();
   lastBlynk = millis();
 }
-
-
   measureVitals();
-  
   static unsigned long lastTempRead = 0;
   if (millis() - lastTempRead > 1000) {
     temperature = readTemperature();
     lastTempRead = millis();
   }
-  
   saveToHistory();
-  
   // Cập nhật OLED mỗi 500ms
   static unsigned long lastOledUpdate = 0;
   if (millis() - lastOledUpdate > 500) {
@@ -702,18 +690,18 @@ void sendToBlynk() {
     Blynk.virtualWrite(V0, (int)heartRate);   // HR
     Blynk.virtualWrite(V1, (int)spo2);        // SpO2
     Blynk.virtualWrite(V2, temperature);      // Temp
-    Blynk.virtualWrite(V3, getHealthWarning()); // ⚠️ CẢNH BÁO
+    Blynk.virtualWrite(V3, getHealthWarning()); //  CẢNH BÁO
       if (millis() - lastNotify > 15000) { // 15 giây mới báo lại
       if (spo2 > 0 && spo2 < 90) {
-        Blynk.logEvent("warning", "🚨 Oxy máu thấp: " + String((int)spo2) + "%");
+        Blynk.logEvent("warning", " Oxy máu thấp: " + String((int)spo2) + "%");
         lastNotify = millis();
       } 
       else if (heartRate > 120) {
-        Blynk.logEvent("warning", "⚠️ Nhịp tim cao: " + String((int)heartRate) + " BPM");
+        Blynk.logEvent("warning", " Nhịp tim cao: " + String((int)heartRate) + " BPM");
         lastNotify = millis();
       } 
       else if (heartRate < 50 && heartRate > 0) {
-        Blynk.logEvent("warning", "⚠️ Nhịp tim thấp: " + String((int)heartRate) + " BPM");
+        Blynk.logEvent("warning", " Nhịp tim thấp: " + String((int)heartRate) + " BPM");
         lastNotify = millis();
       }
     }
@@ -721,25 +709,25 @@ void sendToBlynk() {
     Blynk.virtualWrite(V0, 0);
     Blynk.virtualWrite(V1, 0);
     Blynk.virtualWrite(V2, 0);
-    Blynk.virtualWrite(V3, "❌ Chưa đo");
+    Blynk.virtualWrite(V3, " Chưa đo");
   }
 }
 
 String getHealthWarning() {
   if (!fingerDetected) {
-    return "❌ Chưa đặt ngón tay";
+    return " Chưa đặt ngón tay";
   }
 
   if (spo2 > 0 && spo2 < 90) {
-    return "🚨 NGUY HIỂM: Oxy máu thấp";
+    return " NGUY HIỂM: Oxy máu thấp";
   }
 
   if (heartRate > 120) {
-    return "⚠️ Nhịp tim cao";
+    return " Nhịp tim cao";
   }
 
   if (heartRate < 50 && heartRate > 0) {
-    return "⚠️ Nhịp tim thấp";
+    return " Nhịp tim thấp";
   }
 
   return "✅ Chỉ số bình thường";
