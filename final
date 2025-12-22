@@ -730,6 +730,6 @@ String getHealthWarning() {
     return " Nhịp tim thấp";
   }
 
-  return "✅ Chỉ số bình thường";
+  return " Chỉ số bình thường";
 }
 
