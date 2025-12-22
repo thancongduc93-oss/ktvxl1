@@ -35,6 +35,7 @@ WebServer server(80);
 #define I2C_SCL 9
 #define I2C_ADDR 0x57
 
+unsigned long lastNotify = 0;
 // ========== FIR FILTER BUFFERS ==========
 float firxv[5] = {0};
 float firyv[5] = {0};
@@ -702,6 +703,20 @@ void sendToBlynk() {
     Blynk.virtualWrite(V1, (int)spo2);        // SpO2
     Blynk.virtualWrite(V2, temperature);      // Temp
     Blynk.virtualWrite(V3, getHealthWarning()); // ⚠️ CẢNH BÁO
+      if (millis() - lastNotify > 15000) { // 15 giây mới báo lại
+      if (spo2 > 0 && spo2 < 90) {
+        Blynk.logEvent("warning", "🚨 Oxy máu thấp: " + String((int)spo2) + "%");
+        lastNotify = millis();
+      } 
+      else if (heartRate > 120) {
+        Blynk.logEvent("warning", "⚠️ Nhịp tim cao: " + String((int)heartRate) + " BPM");
+        lastNotify = millis();
+      } 
+      else if (heartRate < 50 && heartRate > 0) {
+        Blynk.logEvent("warning", "⚠️ Nhịp tim thấp: " + String((int)heartRate) + " BPM");
+        lastNotify = millis();
+      }
+    }
   } else {
     Blynk.virtualWrite(V0, 0);
     Blynk.virtualWrite(V1, 0);
