@@ -1,0 +1,638 @@
+#define BLYNK_TEMPLATE_ID "TMPL6HpdLtPR8"
+#define BLYNK_TEMPLATE_NAME "nhiptim"
+#define BLYNK_AUTH_TOKEN "It1phhqw11q4_r0XJfj70CAY9IaGP4Cv"
+#define BLYNK_PRINT Serial
+
+#include <Wire.h> 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <BlynkSimpleEsp32.h>
+#include "MAX30105.h" 
+#include "heartRate.h"
+#include <Adafruit_GFX.h> 
+#include <Adafruit_SSD1306.h> 
+
+/* ===== WIFI & BLYNK ===== */
+const char* ssid = "MU VO DICH";
+const char* password = "12344321";
+char auth[] = BLYNK_AUTH_TOKEN;
+WebServer server(80);
+unsigned long lastNotify = 0;
+unsigned long lastBlynkUpdate = 0;
+unsigned long lastWebUpdate = 0;
+
+/* ===== I2C ESP32-C3 ===== */ 
+#define I2C_SDA 8 
+#define I2C_SCL 9 
+
+/* ===== OLED ===== */ 
+#define SCREEN_WIDTH 128 
+#define SCREEN_HEIGHT 64 
+#define OLED_RESET -1 
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET); 
+
+/* ===== MAX30102 ===== */ 
+MAX30105 particleSensor; 
+
+/* ===== BPM FILTER ===== */ 
+#define RATE_SIZE 10
+byte rates[RATE_SIZE]; 
+byte rateSpot = 0; 
+
+long lastBeat = 0; 
+int beatAvg = 0;
+int displayBPM = 0;
+int lastValidBPM = 0;
+int validSamplesCount = 0;
+
+/* ===== NOISE FILTER CONFIG ===== */
+#define MAX_BPM_CHANGE 15
+#define MIN_VALID_BPM 40
+#define MAX_VALID_BPM 180
+#define OUTLIER_THRESHOLD_BPM 25
+
+/* ===== STABILIZING LOGIC ===== */
+unsigned long stabilizeStartTime = 0;
+bool isStabilizing = false;
+bool isStabilized = false;
+bool isCollectingData = false;
+bool canShowBPM = false;
+bool fingerDetected = false;
+int requiredSamples = 10;
+
+/* ===== LỊCH SỬ ===== */
+#define HISTORY_SIZE 60
+float hrHistory[HISTORY_SIZE];
+int historyIndex = 0;
+int historyCount = 0;
+
+/* ===== NOISE FILTER FUNCTIONS ===== */
+bool isValidBPM(int bpm) {
+  return (bpm >= MIN_VALID_BPM && bpm <= MAX_VALID_BPM);
+}
+
+bool isOutlier(int newBPM, int previousBPM) {
+  if (previousBPM == 0) return false;
+  int diff = abs(newBPM - previousBPM);
+  return (diff > OUTLIER_THRESHOLD_BPM);
+}
+
+int medianFilter(byte arr[], int size) {
+  byte temp[size];
+  int validCount = 0;
+  
+  for (int i = 0; i < size; i++) {
+    if (arr[i] > 0 && isValidBPM(arr[i])) {
+      temp[validCount++] = arr[i];
+    }
+  }
+  
+  if (validCount == 0) return 0;
+  
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = 0; j < validCount - i - 1; j++) {
+      if (temp[j] > temp[j + 1]) {
+        byte t = temp[j];
+        temp[j] = temp[j + 1];
+        temp[j + 1] = t;
+      }
+    }
+  }
+  
+  return temp[validCount / 2];
+}
+
+int smartFilter(byte arr[], int size, int lastValid) {
+  byte filtered[size];
+  int filteredCount = 0;
+  
+  for (int i = 0; i < size; i++) {
+    if (arr[i] > 0 && isValidBPM(arr[i])) {
+      if (lastValid == 0 || !isOutlier(arr[i], lastValid)) {
+        filtered[filteredCount++] = arr[i];
+      }
+    }
+  }
+  
+  if (filteredCount == 0) return lastValid;
+  
+  int median = medianFilter(filtered, filteredCount);
+  
+  if (lastValid > 0) {
+    int diff = median - lastValid;
+    if (abs(diff) > MAX_BPM_CHANGE) {
+      if (diff > 0) {
+        median = lastValid + MAX_BPM_CHANGE;
+      } else {
+        median = lastValid - MAX_BPM_CHANGE;
+      }
+    }
+  }
+  
+  return median;
+}
+
+void updateBPM() {
+  int newBPM = smartFilter(rates, RATE_SIZE, lastValidBPM);
+  
+  if (newBPM > 0) {
+    displayBPM = newBPM;
+    lastValidBPM = newBPM;
+    
+    Serial.println("=== UPDATE BPM ===");
+    Serial.print("Filtered BPM: ");
+    Serial.println(displayBPM);
+    Serial.print("Samples used: ");
+    Serial.println(validSamplesCount);
+    
+    validSamplesCount = 0;
+  }
+}
+
+/* ===== WEB SERVER FUNCTIONS ===== */
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/history", HTTP_GET, handleHistory);
+  server.on("/stats", HTTP_GET, handleStats);
+  server.on("/clear", HTTP_GET, handleClear);
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>MAX30102 Monitor</title>";
+  html += "<style>";
+  html += "* { margin: 0; padding: 0; box-sizing: border-box; }";
+  html += "body { font-family: 'Segoe UI', Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; overflow: hidden; height: 100vh; }";
+  html += ".container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; height: 100vh; padding: 20px; }";
+  html += ".left-col, .right-col { display: flex; flex-direction: column; gap: 15px; }";
+  html += "h1 { text-align: center; font-size: 1.8em; margin-bottom: 10px; }";
+  html += ".card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }";
+  html += ".status-card { display: flex; align-items: center; font-size: 1.1em; padding: 15px 20px; }";
+  html += ".status-indicator { width: 18px; height: 18px; border-radius: 50%; margin-right: 12px; animation: pulse 2s infinite; }";
+  html += "@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }";
+  html += ".ok { background: #0f0; box-shadow: 0 0 20px #0f0; }";
+  html += ".error { background: #f00; box-shadow: 0 0 20px #f00; }";
+  html += ".metric-card { text-align: center; padding: 15px; }";
+  html += ".metric-label { font-size: 1em; margin-bottom: 8px; opacity: 0.9; }";
+  html += ".metric-value { font-size: 3em; font-weight: bold; margin: 10px 0; line-height: 1; }";
+  html += ".metric-unit { font-size: 0.35em; opacity: 0.8; }";
+  html += ".history-section { flex: 1; display: flex; flex-direction: column; overflow: hidden; }";
+  html += ".history-header { font-size: 1.2em; font-weight: bold; margin-bottom: 10px; text-align: center; }";
+  html += ".history-content { flex: 1; overflow-y: auto; font-size: 0.9em; line-height: 1.6; }";
+  html += ".history-content::-webkit-scrollbar { width: 8px; }";
+  html += ".history-content::-webkit-scrollbar-track { background: rgba(255,255,255,0.1); border-radius: 10px; }";
+  html += ".history-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.3); border-radius: 10px; }";
+  html += ".history-item { padding: 8px; border-bottom: 1px solid rgba(255,255,255,0.1); }";
+  html += ".no-data { text-align: center; padding: 20px; opacity: 0.6; }";
+  html += ".btn-group { display: flex; gap: 10px; }";
+  html += "button { flex: 1; background: rgba(255,255,255,0.2); color: white; border: 2px solid rgba(255,255,255,0.3); padding: 12px; border-radius: 10px; cursor: pointer; font-size: 0.95em; transition: all 0.3s; }";
+  html += "button:hover { background: rgba(255,255,255,0.3); transform: translateY(-2px); }";
+  html += "@media (max-width: 768px) { .container { grid-template-columns: 1fr; overflow-y: auto; height: auto; } .metric-value { font-size: 2.5em; } }";
+  html += "</style>";
+  
+  html += "<script>";
+  html += "let currentView = 'history';";
+  html += "function updateData() {";
+  html += "  fetch('/data').then(r => r.json()).then(d => {";
+  html += "    document.getElementById('hr').innerHTML = d.hr > 0 ? d.hr : '--';";
+  html += "    document.getElementById('status').className = 'status-indicator ' + (d.finger ? 'ok' : 'error');";
+  html += "    document.getElementById('status-text').innerHTML = d.finger ? '✅ Đang đo' : '❌ Đặt ngón tay';";
+  html += "    document.getElementById('hr').style.color = (d.hr >= 50 && d.hr <= 120) ? '#0f8' : '#fa0';";
+  html += "  });";
+  html += "}";
+  
+  html += "function showHistory() {";
+  html += "  currentView = 'history';";
+  html += "  document.getElementById('data-header').innerHTML = '📊 LỊCH SỬ';";
+  html += "  fetch('/history').then(r => r.text()).then(text => {";
+  html += "    const lines = text.split('\\n').filter(l => l.trim());";
+  html += "    if (lines.length <= 2 || text.includes('Chưa có')) {";
+  html += "      document.getElementById('data-content').innerHTML = '<div class=\"no-data\">Chưa có dữ liệu</div>';";
+  html += "      return;";
+  html += "    }";
+  html += "    let html = '';";
+  html += "    for (let i = 2; i < lines.length; i++) {";
+  html += "      html += '<div class=\"history-item\">' + lines[i] + '</div>';";
+  html += "    }";
+  html += "    document.getElementById('data-content').innerHTML = html;";
+  html += "  });";
+  html += "}";
+  
+  html += "function showStats() {";
+  html += "  currentView = 'stats';";
+  html += "  document.getElementById('data-header').innerHTML = '📈 THỐNG KÊ';";
+  html += "  fetch('/stats').then(r => r.text()).then(text => {";
+  html += "    if (text.includes('Chưa có')) {";
+  html += "      document.getElementById('data-content').innerHTML = '<div class=\"no-data\">Chưa có dữ liệu</div>';";
+  html += "      return;";
+  html += "    }";
+  html += "    const lines = text.split('\\n').filter(l => l.trim());";
+  html += "    let html = '';";
+  html += "    for (let i = 0; i < lines.length; i++) {";
+  html += "      html += '<div style=\"margin:8px 0\">' + lines[i] + '</div>';";
+  html += "    }";
+  html += "    document.getElementById('data-content').innerHTML = html;";
+  html += "  });";
+  html += "}";
+  
+  html += "function clearData() {";
+  html += "  if (confirm('Xóa tất cả dữ liệu?')) {";
+  html += "    fetch('/clear').then(r => r.text()).then(msg => { alert(msg); showHistory(); });";
+  html += "  }";
+  html += "}";
+  
+  html += "setInterval(updateData, 2000);";
+  html += "setInterval(() => { if (currentView === 'history') showHistory(); else if (currentView === 'stats') showStats(); }, 3000);";
+  html += "updateData(); showHistory();";
+  html += "</script></head><body>";
+  
+  html += "<div class='container'>";
+  html += "<div class='left-col'>";
+  html += "<h1>💓 NHỊP TIM</h1>";
+  html += "<div class='card status-card'><div id='status' class='status-indicator'></div><div id='status-text'>...</div></div>";
+  html += "<div class='card metric-card'><div class='metric-label'>❤️ NHỊP TIM</div><div class='metric-value' id='hr'>--<span class='metric-unit'>BPM</span></div></div>";
+  html += "</div>";
+  
+  html += "<div class='right-col'>";
+  html += "<div class='card'><div class='btn-group'><button onclick='showHistory()'>📊 Lịch sử</button><button onclick='showStats()'>📈 Thống kê</button><button onclick='clearData()'>🗑️ Xóa</button></div></div>";
+  html += "<div class='card history-section'><div class='history-header' id='data-header'>📊 LỊCH SỬ</div><div class='history-content' id='data-content'>Đang tải...</div></div>";
+  html += "</div>";
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  String json = "{\"hr\":" + String((int)displayBPM) + 
+                ",\"finger\":" + (fingerDetected ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() {
+  String result = "LỊCH SỬ (" + String(historyCount) + ")\n\n";
+  if (historyCount == 0) {
+    result = "Chưa có dữ liệu!";
+  } else {
+    for (int i = 0; i < historyCount; i++) {
+      result += String(i + 1) + ". " + String((int)hrHistory[i]) + " BPM\n";
+    }
+  }
+  server.send(200, "text/plain; charset=utf-8", result);
+}
+
+void handleStats() {
+  if (historyCount == 0) {
+    server.send(200, "text/plain", "Chưa có dữ liệu!");
+    return;
+  }
+  
+  float hrMin = 999, hrMax = 0, hrSum = 0;
+  int hrCount = 0;
+  
+  for (int i = 0; i < historyCount; i++) {
+    if (hrHistory[i] > 0) {
+      if (hrHistory[i] < hrMin) hrMin = hrHistory[i];
+      if (hrHistory[i] > hrMax) hrMax = hrHistory[i];
+      hrSum += hrHistory[i];
+      hrCount++;
+    }
+  }
+  
+  String result = "THỐNG KÊ\n\n";
+  result += "HR: TB=" + String((int)(hrSum / hrCount)) + 
+            " Min=" + String((int)hrMin) + 
+            " Max=" + String((int)hrMax);
+  
+  server.send(200, "text/plain; charset=utf-8", result);
+}
+
+void handleClear() {
+  historyCount = 0;
+  historyIndex = 0;
+  server.send(200, "text/plain", "Đã xóa!");
+}
+
+void saveToHistory() {
+  static unsigned long lastSave = 0;
+  if (millis() - lastSave < 10000) return;  // 10 giây
+  lastSave = millis();
+  
+  if (fingerDetected && displayBPM > 0) {
+    hrHistory[historyIndex] = displayBPM;
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+    if (historyCount < HISTORY_SIZE) historyCount++;
+  }
+}
+
+/* ===== BLYNK FUNCTIONS ===== */
+void sendToBlynk() {
+  if (!Blynk.connected()) return;
+
+  if (fingerDetected && displayBPM > 0) {
+    Blynk.virtualWrite(V0, (int)displayBPM);
+    Blynk.virtualWrite(V3, getHealthWarning());
+    
+    if (millis() - lastNotify > 15000) {
+      if (displayBPM > 120) {
+        Blynk.logEvent("warning", "⚠️ Nhịp tim cao: " + String((int)displayBPM) + " BPM");
+        lastNotify = millis();
+      } 
+      else if (displayBPM < 50) {
+        Blynk.logEvent("warning", "⚠️ Nhịp tim thấp: " + String((int)displayBPM) + " BPM");
+        lastNotify = millis();
+      }
+    }
+  } else {
+    Blynk.virtualWrite(V0, 0);
+    Blynk.virtualWrite(V3, "❌ Chưa đo");
+  }
+}
+
+String getHealthWarning() {
+  if (!fingerDetected) {
+    return "❌ Chưa đặt ngón tay";
+  }
+
+  if (displayBPM > 120) {
+    return "⚠️ Nhịp tim cao";
+  }
+
+  if (displayBPM < 50 && displayBPM > 0) {
+    return "⚠️ Nhịp tim thấp";
+  }
+
+  return "✅ Chỉ số bình thường";
+}
+
+/* ===== SETUP ===== */
+void setup() { 
+  Serial.begin(115200); 
+
+  Wire.begin(I2C_SDA, I2C_SCL); 
+  Wire.setClock(400000); 
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println("OLED Error!");
+    while (1); 
+  } 
+
+  display.clearDisplay(); 
+  display.setTextSize(1); 
+  display.setTextColor(SSD1306_WHITE); 
+  display.setCursor(0, 0); 
+  display.println("ESP32-C3"); 
+  display.println("MAX30102 BPM"); 
+  display.display(); 
+  delay(1000);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) { 
+    display.clearDisplay(); 
+    display.println("MAX30102 FAIL"); 
+    display.display(); 
+    while (1); 
+  } 
+
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x1F);
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.print("Connecting WiFi");
+  display.display();
+  
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\nIP: http://");
+    Serial.println(WiFi.localIP());
+    
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect(5000);
+    
+    if (Blynk.connected()) {
+      Serial.println("Blynk Connected");
+    }
+    
+    display.clearDisplay();
+    display.setCursor(0, 10);
+    display.print("WiFi OK!");
+    display.setCursor(0, 25);
+    display.print("IP:");
+    display.setCursor(0, 40);
+    display.print(WiFi.localIP());
+    display.display();
+    delay(2000);
+    
+    setupWebServer();
+    server.begin();
+    Serial.println("Web Server Started");
+  } else {
+    Serial.println("\nNo WiFi");
+    display.clearDisplay();
+    display.setCursor(0, 25);
+    display.print("No WiFi");
+    display.display();
+    delay(2000);
+  }
+
+  Serial.println("Put finger on sensor");
+  delay(1000);
+} 
+
+/* ===== LOOP ===== */
+void loop() { 
+  // Handle web & Blynk - GIẢM TẦN SUẤT
+  if (millis() - lastWebUpdate > 100) {  // Chỉ 10 lần/giây
+    server.handleClient();
+    lastWebUpdate = millis();
+  }
+  
+  Blynk.run();
+  
+  if (millis() - lastBlynkUpdate > 2000) {  // 2 giây/lần
+    sendToBlynk();
+    lastBlynkUpdate = millis();
+  }
+  
+  long irValue = particleSensor.getIR(); 
+
+  if (irValue < 50000) {
+    fingerDetected = false;
+    
+    if (isStabilizing || isStabilized || isCollectingData || canShowBPM) {
+      isStabilizing = false;
+      isStabilized = false;
+      isCollectingData = false;
+      canShowBPM = false;
+      stabilizeStartTime = 0;
+      beatAvg = 0;
+      displayBPM = 0;
+      lastValidBPM = 0;
+      validSamplesCount = 0;
+      for (byte i = 0; i < RATE_SIZE; i++) {
+        rates[i] = 0;
+      }
+      rateSpot = 0;
+      Serial.println("RESET - No finger");
+    }
+  } else {
+    fingerDetected = true;
+    
+    if (!isStabilizing && !isStabilized && !isCollectingData && !canShowBPM) {
+      isStabilizing = true;
+      stabilizeStartTime = millis();
+      validSamplesCount = 0;
+      Serial.println("State: STABILIZING (5s)");
+    }
+
+    if (isStabilizing) {
+      unsigned long elapsed = millis() - stabilizeStartTime;
+      if (elapsed >= 5000) {
+        isStabilizing = false;
+        isStabilized = true;
+        validSamplesCount = 0;
+        Serial.println("State: COLLECTING INITIAL 10 SAMPLES");
+      }
+    } else if (isStabilized) {
+      if (validSamplesCount >= requiredSamples) {
+        isStabilized = false;
+        isCollectingData = true;
+        canShowBPM = true;
+        
+        displayBPM = smartFilter(rates, RATE_SIZE, lastValidBPM);
+        lastValidBPM = displayBPM;
+        
+        Serial.print("Initial BPM: ");
+        Serial.println(displayBPM);
+        Serial.println("State: MEASURING");
+        
+        validSamplesCount = 0;
+      }
+    }
+
+    if ((isStabilized || isCollectingData) && checkForBeat(irValue)) { 
+      long now = millis(); 
+      long delta = now - lastBeat; 
+      lastBeat = now; 
+
+      if (delta > 300 && delta < 2000) { 
+        int bpm = 60 * 1000 / delta;
+        
+        if (isValidBPM(bpm)) {
+          rates[rateSpot++] = bpm; 
+          rateSpot %= RATE_SIZE; 
+          validSamplesCount++;
+          
+          Serial.print("Valid samples: ");
+          Serial.print(validSamplesCount);
+          Serial.print("/");
+          Serial.println(requiredSamples);
+          
+          if (isCollectingData && validSamplesCount >= requiredSamples) {
+            updateBPM();
+          }
+          
+          beatAvg = 0; 
+          int count = 0;
+          for (byte i = 0; i < RATE_SIZE; i++) { 
+            if (rates[i] > 0) {
+              beatAvg += rates[i];
+              count++;
+            }
+          } 
+          if (count > 0) beatAvg /= count;
+          
+          Serial.print("Raw BPM: ");
+          Serial.print(bpm);
+          Serial.print(" | Avg: ");
+          Serial.println(beatAvg);
+        } else {
+          Serial.print("Rejected BPM: ");
+          Serial.println(bpm);
+        }
+      } 
+    }
+  }
+
+  /* OLED Display */
+  static unsigned long lastOledUpdate = 0;
+  if (millis() - lastOledUpdate > 500) {
+    display.clearDisplay(); 
+    display.setCursor(0, 0); 
+
+    if (irValue < 50000) { 
+      display.println("No finger"); 
+      display.setTextSize(1);
+      display.setCursor(0, 20);
+      display.println("Place finger on");
+      display.println("sensor with");
+      display.println("steady pressure");
+    } else if (isStabilizing) {
+      unsigned long elapsed = millis() - stabilizeStartTime;
+      unsigned long remaining = (5000 - elapsed) / 1000;
+      
+      display.println("Stabilizing...");
+      display.setTextSize(2);
+      display.setCursor(0, 20);
+      display.print(remaining);
+      display.println(" sec");
+      display.setTextSize(1);
+      display.setCursor(0, 50);
+      display.println("Hold steady");
+    } else if (isStabilized) {
+      display.println("Collecting...");
+      display.setTextSize(1);
+      display.setCursor(0, 15);
+      display.print("Samples: ");
+      display.print(validSamplesCount);
+      display.print("/");
+      display.print(requiredSamples);
+    } else if (canShowBPM && displayBPM > 0) { 
+      display.setTextSize(1);
+      display.println("Heart Rate");
+      display.setCursor(0, 15);
+      display.setTextSize(3);
+      display.print(displayBPM);
+      display.setTextSize(1);
+      display.println(" BPM");
+      
+      display.setCursor(0, 45);
+      display.print("Next: ");
+      display.print(validSamplesCount);
+      display.print("/");
+      display.print(requiredSamples);
+      
+      display.setCursor(0, 55);
+      int filledCount = 0;
+      for (byte i = 0; i < RATE_SIZE; i++) {
+        if (rates[i] > 0) filledCount++;
+      }
+      display.print("Buf: ");
+      display.print(filledCount);
+      display.print("/");
+      display.print(RATE_SIZE);
+    } else {
+      display.println("Measuring...");
+      display.setTextSize(1);
+      display.setCursor(0, 20);
+      display.println("Please wait");
+    }
+
+    display.display();
+    lastOledUpdate = millis();
+  }
+  
+  // Lưu lịch sử
+  saveToHistory();
+}
